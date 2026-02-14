@@ -1,0 +1,10 @@
+[package]
+name = "iv"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+macroquad = "0.4"
+image = "0.25"
+clap = { version = "4", features = ["derive"] }
+sysinfo = "0.31"
