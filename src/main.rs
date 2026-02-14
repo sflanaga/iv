@@ -225,23 +225,46 @@ impl CacheState {
             return Some(self.current_idx);
         }
 
-        // For non-current images, respect budget
+        // For non-current images, respect budget.
+        // Be conservative: assume next image is average size.
         let avg = self.avg_image_size();
         let pending_bytes = self.in_progress.len() as u64 * avg;
-        if self.used_bytes + pending_bytes >= self.budget {
+        if self.used_bytes + pending_bytes + avg > self.budget {
             return None;
         }
 
+        let mut stop_fwd = false;
+        let mut stop_bwd = false;
+
         for dist in 1..self.file_count {
-            let fwd = self.current_idx + dist;
-            if self.is_available(fwd) {
-                return Some(fwd);
+            if stop_fwd && stop_bwd {
+                break;
             }
-            if dist <= self.current_idx {
+
+            if !stop_fwd {
+                let fwd = self.current_idx + dist;
+                if fwd < self.file_count {
+                    if self.saturated.contains(&fwd) {
+                        stop_fwd = true;
+                        log::debug!("[find_work] Stop FWD at saturated idx={}", fwd);
+                    } else if self.is_available(fwd) {
+                        return Some(fwd);
+                    }
+                } else {
+                    stop_fwd = true;
+                }
+            }
+
+            if !stop_bwd && dist <= self.current_idx {
                 let bwd = self.current_idx - dist;
-                if self.is_available(bwd) {
+                if self.saturated.contains(&bwd) {
+                    stop_bwd = true;
+                    log::debug!("[find_work] Stop BWD at saturated idx={}", bwd);
+                } else if self.is_available(bwd) {
                     return Some(bwd);
                 }
+            } else if dist > self.current_idx {
+                stop_bwd = true;
             }
         }
         None
@@ -262,9 +285,11 @@ impl CacheState {
                 .map(|&i| if i >= self.current_idx { i - self.current_idx } else { self.current_idx - i })
                 .max()
                 .unwrap_or(0);
+            
+            // If we are farther than the farthest thing we have, we can't fit.
             if my_dist >= farthest_cached_dist {
-                eprintln!(
-                    "[saturated] idx={} dist={} (farthest_cached_dist={})",
+                log::debug!(
+                    "[saturated] idx={} dist={} (farthest_cached_dist={}) - skipping insert",
                     idx, my_dist, farthest_cached_dist,
                 );
                 self.saturated.insert(idx);
@@ -276,6 +301,13 @@ impl CacheState {
             self.used_bytes -= old.mem_size();
         }
         self.used_bytes += decoded.mem_size();
+        log::debug!(
+            "[insert] idx={} size={:.1}MB used={:.1}/{:.1}MB",
+            idx,
+            decoded.mem_size() as f64 / (1024.0 * 1024.0),
+            self.used_bytes as f64 / (1024.0 * 1024.0),
+            self.budget as f64 / (1024.0 * 1024.0)
+        );
         self.images.insert(idx, Arc::new(decoded));
         self.evict_distant();
     }
@@ -297,7 +329,7 @@ impl CacheState {
             match farthest {
                 Some(evict_idx) => {
                     if let Some(img) = self.images.remove(&evict_idx) {
-                        eprintln!(
+                        log::debug!(
                             "[evict] idx={} dist={} freed={:.1}MB",
                             evict_idx,
                             if evict_idx >= self.current_idx { evict_idx - self.current_idx } else { self.current_idx - evict_idx },
@@ -365,7 +397,7 @@ fn spawn_decode_workers(
                             let bytes = decoded.rgba_bytes.len() as f64;
                             let secs = elapsed.as_secs_f64();
                             let mbps = if secs > 0.0 { bytes / secs / (1024.0 * 1024.0) } else { 0.0 };
-                            eprintln!(
+                            log::debug!(
                                 "[decode] idx={} file={} {:.1}ms {:.1} MB/s",
                                 idx,
                                 files[idx].file_name().unwrap_or_default().to_string_lossy(),
@@ -375,7 +407,7 @@ fn spawn_decode_workers(
                             state.insert(idx, decoded);
                         }
                         Err(e) => {
-                            eprintln!(
+                            log::warn!(
                                 "[decode] idx={} file={} FAILED: {}",
                                 idx,
                                 files[idx].file_name().unwrap_or_default().to_string_lossy(),
@@ -1057,7 +1089,7 @@ impl ViewerState {
                 let before = state.images.keys().filter(|&&k| k < cur).count();
                 let after = state.images.keys().filter(|&&k| k > cur).count();
                 let in_prog: Vec<usize> = state.in_progress.iter().copied().collect();
-                eprintln!(
+                log::debug!(
                     "[loading] idx={} cached_before={} cached_after={} total_cached={} in_progress={:?}",
                     cur, before, after, state.images.len(), in_prog,
                 );
@@ -1334,6 +1366,7 @@ impl ApplicationHandler<UserEvent> for App {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    env_logger::init();
     let cli = Cli::parse();
 
     let budget = match &cli.memory {
@@ -1343,7 +1376,7 @@ fn main() {
 
     let files = collect_images(&cli.paths, cli.recursive);
     if files.is_empty() {
-        eprintln!("No image files found.");
+        log::error!("No image files found.");
         return;
     }
 
