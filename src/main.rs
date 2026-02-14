@@ -1,16 +1,16 @@
 use clap::Parser;
 use image::GenericImageView;
 use softbuffer::Surface;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
@@ -19,7 +19,6 @@ use winit::window::{Fullscreen, Window, WindowId};
 // ---------------------------------------------------------------------------
 
 const ZOOM_FACTOR: f32 = 0.25;
-const PREFETCH_COUNT: usize = 3;
 const BG_COLOR: [u8; 4] = [31, 31, 31, 255]; // ~0.12 * 255
 const IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "bmp", "tga", "tiff", "tif", "webp", "ico", "pnm", "pbm",
@@ -154,108 +153,247 @@ fn decode_image(path: &Path) -> Result<DecodedImage, String> {
 }
 
 // ---------------------------------------------------------------------------
-// LRU Image Cache (thread-safe, CPU-decoded images)
+// Cache state (shared between UI and worker threads via Mutex + Condvar)
 // ---------------------------------------------------------------------------
 
-struct CacheEntry {
-    decoded: Arc<DecodedImage>,
-}
-
-struct ImageCache {
-    map: HashMap<usize, CacheEntry>,
-    order: VecDeque<usize>,  // front = least recently used
+struct CacheState {
+    current_idx: usize,
+    images: HashMap<usize, Arc<DecodedImage>>,
+    in_progress: HashSet<usize>,
+    errors: HashMap<usize, String>,
     used_bytes: u64,
     budget: u64,
-    pending: HashSet<usize>,
+    file_count: usize,
+    /// Indices that were decoded but couldn't be kept (cache full, too far).
+    /// Cleared when current_idx changes so they can be re-evaluated.
+    saturated: HashSet<usize>,
 }
 
-impl ImageCache {
-    fn new(budget: u64) -> Self {
+type SharedState = Arc<(Mutex<CacheState>, Condvar)>;
+
+impl CacheState {
+    fn new(budget: u64, file_count: usize) -> Self {
         Self {
-            map: HashMap::new(),
-            order: VecDeque::new(),
+            current_idx: 0,
+            images: HashMap::new(),
+            in_progress: HashSet::new(),
+            errors: HashMap::new(),
             used_bytes: 0,
             budget,
-            pending: HashSet::new(),
+            file_count,
+            saturated: HashSet::new(),
         }
     }
 
-    fn get(&mut self, idx: usize) -> Option<Arc<DecodedImage>> {
-        if self.map.contains_key(&idx) {
-            self.order.retain(|&i| i != idx);
-            self.order.push_back(idx);
-            Some(Arc::clone(&self.map[&idx].decoded))
+    fn set_current_idx(&mut self, idx: usize) {
+        if idx != self.current_idx {
+            self.current_idx = idx;
+            self.saturated.clear();
+        }
+    }
+
+    fn get(&self, idx: usize) -> Option<Arc<DecodedImage>> {
+        self.images.get(&idx).cloned()
+    }
+
+    /// Average decoded image size in bytes (fallback: ~8 MB).
+    fn avg_image_size(&self) -> u64 {
+        if self.images.is_empty() {
+            8 * 1024 * 1024
         } else {
-            None
+            self.used_bytes / self.images.len() as u64
         }
     }
 
-    fn insert(&mut self, idx: usize, decoded: DecodedImage) {
-        let mem = decoded.mem_size();
-        let arc = Arc::new(decoded);
-        // Evict until we have room
-        while self.used_bytes + mem > self.budget && !self.order.is_empty() {
-            if let Some(evict_idx) = self.order.pop_front() {
-                if let Some(entry) = self.map.remove(&evict_idx) {
-                    self.used_bytes -= entry.decoded.mem_size();
+    fn is_available(&self, idx: usize) -> bool {
+        idx < self.file_count
+            && !self.images.contains_key(&idx)
+            && !self.in_progress.contains(&idx)
+            && !self.errors.contains_key(&idx)
+            && !self.saturated.contains(&idx)
+    }
+
+    /// Find the nearest un-cached, non-in-progress index to current_idx.
+    /// Spirals outward (+1, -1, +2, -2, ...). Returns None if nothing to do.
+    fn find_work(&self) -> Option<usize> {
+        // Always prioritize current_idx regardless of budget
+        if self.current_idx < self.file_count
+            && !self.images.contains_key(&self.current_idx)
+            && !self.in_progress.contains(&self.current_idx)
+            && !self.errors.contains_key(&self.current_idx)
+        {
+            return Some(self.current_idx);
+        }
+
+        // For non-current images, respect budget
+        let avg = self.avg_image_size();
+        let pending_bytes = self.in_progress.len() as u64 * avg;
+        if self.used_bytes + pending_bytes >= self.budget {
+            return None;
+        }
+
+        for dist in 1..self.file_count {
+            let fwd = self.current_idx + dist;
+            if self.is_available(fwd) {
+                return Some(fwd);
+            }
+            if dist <= self.current_idx {
+                let bwd = self.current_idx - dist;
+                if self.is_available(bwd) {
+                    return Some(bwd);
                 }
             }
         }
-        self.used_bytes += mem;
-        self.map.insert(idx, CacheEntry { decoded: arc });
-        self.order.retain(|&i| i != idx);
-        self.order.push_back(idx);
-        self.pending.remove(&idx);
+        None
     }
 
-    fn contains(&self, idx: usize) -> bool {
-        self.map.contains_key(&idx)
+    /// Insert a decoded image, then evict distant images if over budget.
+    /// If the new image would be the farthest and over budget, skip it
+    /// (it would be immediately evicted) and mark it saturated.
+    fn insert(&mut self, idx: usize, decoded: DecodedImage) {
+        if idx != self.current_idx && self.used_bytes + decoded.mem_size() > self.budget {
+            let my_dist = if idx >= self.current_idx {
+                idx - self.current_idx
+            } else {
+                self.current_idx - idx
+            };
+            let farthest_cached_dist = self.images.keys()
+                .filter(|&&i| i != self.current_idx)
+                .map(|&i| if i >= self.current_idx { i - self.current_idx } else { self.current_idx - i })
+                .max()
+                .unwrap_or(0);
+            if my_dist >= farthest_cached_dist {
+                eprintln!(
+                    "[saturated] idx={} dist={} (farthest_cached_dist={})",
+                    idx, my_dist, farthest_cached_dist,
+                );
+                self.saturated.insert(idx);
+                return;
+            }
+        }
+        // Handle re-insertion: subtract old bytes first
+        if let Some(old) = self.images.remove(&idx) {
+            self.used_bytes -= old.mem_size();
+        }
+        self.used_bytes += decoded.mem_size();
+        self.images.insert(idx, Arc::new(decoded));
+        self.evict_distant();
     }
 
-    fn is_pending(&self, idx: usize) -> bool {
-        self.pending.contains(&idx)
-    }
-
-    fn mark_pending(&mut self, idx: usize) {
-        self.pending.insert(idx);
+    /// Remove images farthest from current_idx until under budget.
+    /// Never evicts the current_idx image.
+    fn evict_distant(&mut self) {
+        while self.used_bytes > self.budget && self.images.len() > 1 {
+            let farthest = self.images.keys()
+                .filter(|&&idx| idx != self.current_idx)
+                .max_by_key(|&&idx| {
+                    if idx >= self.current_idx {
+                        idx - self.current_idx
+                    } else {
+                        self.current_idx - idx
+                    }
+                })
+                .copied();
+            match farthest {
+                Some(evict_idx) => {
+                    if let Some(img) = self.images.remove(&evict_idx) {
+                        eprintln!(
+                            "[evict] idx={} dist={} freed={:.1}MB",
+                            evict_idx,
+                            if evict_idx >= self.current_idx { evict_idx - self.current_idx } else { self.current_idx - evict_idx },
+                            img.mem_size() as f64 / (1024.0 * 1024.0),
+                        );
+                        self.used_bytes -= img.mem_size();
+                    }
+                }
+                None => break, // only current_idx remains
+            }
+        }
     }
 }
 
-type SharedCache = Arc<Mutex<ImageCache>>;
-
 // ---------------------------------------------------------------------------
-// Background loader
+// User event for waking the UI from worker threads
 // ---------------------------------------------------------------------------
 
-fn request_load(cache: &SharedCache, files: &[PathBuf], idx: usize) {
-    let mut c = cache.lock().unwrap();
-    if c.contains(idx) || c.is_pending(idx) || idx >= files.len() {
-        return;
-    }
-    c.mark_pending(idx);
-    let cache2 = Arc::clone(cache);
-    let path = files[idx].clone();
-    thread::spawn(move || {
-        let result = decode_image(&path);
-        let mut c = cache2.lock().unwrap();
-        c.pending.remove(&idx);
-        if let Ok(decoded) = result {
-            c.insert(idx, decoded);
-        }
-    });
+#[derive(Debug)]
+enum UserEvent {
+    ImageReady(usize),
 }
 
-fn prefetch(cache: &SharedCache, files: &[PathBuf], current: usize) {
-    // Prefetch forward
-    for i in 1..=PREFETCH_COUNT {
-        let idx = current + i;
-        if idx < files.len() {
-            request_load(cache, files, idx);
-        }
-    }
-    // Prefetch one backward
-    if current > 0 {
-        request_load(cache, files, current - 1);
+// ---------------------------------------------------------------------------
+// Background decode workers
+// ---------------------------------------------------------------------------
+
+fn spawn_decode_workers(
+    shared: SharedState,
+    files: Arc<Vec<PathBuf>>,
+    proxy: EventLoopProxy<UserEvent>,
+    num_threads: usize,
+) {
+    for _ in 0..num_threads {
+        let shared = Arc::clone(&shared);
+        let files = Arc::clone(&files);
+        let proxy = proxy.clone();
+        thread::spawn(move || {
+            loop {
+                // Wait for work
+                let idx = {
+                    let (lock, cvar) = &*shared;
+                    let mut state = lock.lock().unwrap();
+                    loop {
+                        if let Some(idx) = state.find_work() {
+                            state.in_progress.insert(idx);
+                            break idx;
+                        }
+                        state = cvar.wait(state).unwrap();
+                    }
+                };
+
+                // Decode (no lock held — this is the slow part)
+                let t0 = Instant::now();
+                let result = decode_image(&files[idx]);
+                let elapsed = t0.elapsed();
+
+                // Insert result and wake other workers
+                {
+                    let (lock, cvar) = &*shared;
+                    let mut state = lock.lock().unwrap();
+                    state.in_progress.remove(&idx);
+                    match result {
+                        Ok(decoded) => {
+                            let bytes = decoded.rgba_bytes.len() as f64;
+                            let secs = elapsed.as_secs_f64();
+                            let mbps = if secs > 0.0 { bytes / secs / (1024.0 * 1024.0) } else { 0.0 };
+                            eprintln!(
+                                "[decode] idx={} file={} {:.1}ms {:.1} MB/s",
+                                idx,
+                                files[idx].file_name().unwrap_or_default().to_string_lossy(),
+                                secs * 1000.0,
+                                mbps,
+                            );
+                            state.insert(idx, decoded);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[decode] idx={} file={} FAILED: {}",
+                                idx,
+                                files[idx].file_name().unwrap_or_default().to_string_lossy(),
+                                e,
+                            );
+                            state.errors.insert(
+                                idx,
+                                format!("{}: {}", files[idx].display(), e),
+                            );
+                        }
+                    }
+                    cvar.notify_all();
+                }
+
+                // Wake the UI
+                let _ = proxy.send_event(UserEvent::ImageReady(idx));
+            }
+        });
     }
 }
 
@@ -542,8 +680,8 @@ fn fill_rect(buf: &mut [u32], stride: u32, buf_h: u32, rx: i32, ry: i32, rw: u32
 // ---------------------------------------------------------------------------
 
 struct ViewerState {
-    files: Vec<PathBuf>,
-    cache: SharedCache,
+    files: Arc<Vec<PathBuf>>,
+    shared: SharedState,
     current_index: usize,
     current_decoded: Option<Arc<DecodedImage>>,
     error_message: Option<String>,
@@ -556,7 +694,6 @@ struct ViewerState {
     dragging: bool,
     drag_start: (f64, f64),
     drag_offset_start: (f32, f32),
-    needs_load: bool,
     mouse_pos: (f64, f64),
 
     // Key-hold repeat state
@@ -580,14 +717,14 @@ struct ViewerState {
 
 impl ViewerState {
     fn new(
-        files: Vec<PathBuf>,
-        cache: SharedCache,
+        files: Arc<Vec<PathBuf>>,
+        shared: SharedState,
         initial_delay: f64,
         repeat_delay: f64,
     ) -> Self {
         Self {
             files,
-            cache,
+            shared,
             current_index: 0,
             current_decoded: None,
             error_message: None,
@@ -599,7 +736,6 @@ impl ViewerState {
             dragging: false,
             drag_start: (0.0, 0.0),
             drag_offset_start: (0.0, 0.0),
-            needs_load: true,
             mouse_pos: (0.0, 0.0),
             initial_delay,
             repeat_delay,
@@ -684,17 +820,44 @@ impl ViewerState {
         }
 
         if nav != 0 {
-            let new_idx = (self.current_index as i64 + nav as i64)
-                .clamp(0, self.files.len() as i64 - 1) as usize;
-            if new_idx != self.current_index {
-                self.current_index = new_idx;
-                self.needs_load = true;
-                self.zoom = 0.0;
-                self.offset_x = 0.0;
-                self.offset_y = 0.0;
-                self.error_message = None;
+            // If current image is still loading, don't advance — poll cache instead
+            if self.current_decoded.is_none() && self.error_message.is_none() {
+                let (lock, cvar) = &*self.shared;
+                let mut state = lock.lock().unwrap();
+                // Ensure workers know our actual position
+                state.set_current_idx(self.current_index);
+                if let Some(img) = state.get(self.current_index) {
+                    self.current_decoded = Some(img);
+                } else if let Some(err) = state.errors.get(&self.current_index) {
+                    self.error_message = Some(format!("Could not load: {}", err));
+                }
+                cvar.notify_all();
+                // Don't advance yet — wait for current image
+            } else {
+                let new_idx = (self.current_index as i64 + nav as i64)
+                    .clamp(0, self.files.len() as i64 - 1) as usize;
+                if new_idx != self.current_index {
+                    self.current_index = new_idx;
+                    self.error_message = None;
+                    self.zoom = 0.0;
+                    self.offset_x = 0.0;
+                    self.offset_y = 0.0;
+
+                    // Update shared state and wake workers
+                    let (lock, cvar) = &*self.shared;
+                    let mut state = lock.lock().unwrap();
+                    state.set_current_idx(new_idx);
+                    if let Some(img) = state.get(new_idx) {
+                        self.current_decoded = Some(img);
+                    } else if let Some(err) = state.errors.get(&new_idx) {
+                        self.error_message = Some(format!("Could not load: {}", err));
+                        self.current_decoded = None;
+                    } else {
+                        self.current_decoded = None;
+                    }
+                    cvar.notify_all();
+                }
             }
-            prefetch(&self.cache, &self.files, self.current_index);
         }
 
         // ------------------------------------------------------------------
@@ -792,65 +955,6 @@ impl ViewerState {
             }
         }
 
-        // ------------------------------------------------------------------
-        // Load current image if needed
-        // ------------------------------------------------------------------
-        if self.needs_load {
-            self.current_decoded = None;
-
-            request_load(&self.cache, &self.files, self.current_index);
-
-            let maybe = {
-                let mut c = self.cache.lock().unwrap();
-                c.get(self.current_index)
-            };
-            if let Some(dec) = maybe {
-                self.current_decoded = Some(dec);
-                self.needs_load = false;
-                self.error_message = None;
-            }
-        }
-
-        // Try to pick up a cached image that was loading in the background
-        if self.needs_load && self.error_message.is_none() {
-            let maybe = {
-                let mut c = self.cache.lock().unwrap();
-                c.get(self.current_index)
-            };
-            match maybe {
-                Some(dec) => {
-                    self.current_decoded = Some(dec);
-                    self.needs_load = false;
-                }
-                None => {
-                    // Check if it's no longer pending (i.e. failed)
-                    let c = self.cache.lock().unwrap();
-                    if !c.is_pending(self.current_index) && !c.contains(self.current_index) {
-                        drop(c);
-                        match decode_image(&self.files[self.current_index]) {
-                            Ok(decoded) => {
-                                let arc = {
-                                    let mut c = self.cache.lock().unwrap();
-                                    c.insert(self.current_index, decoded);
-                                    c.get(self.current_index).unwrap()
-                                };
-                                self.current_decoded = Some(arc);
-                                self.needs_load = false;
-                            }
-                            Err(e) => {
-                                self.error_message = Some(format!(
-                                    "Could not load: {} {}",
-                                    self.files[self.current_index].display(),
-                                    e
-                                ));
-                                self.needs_load = false;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         // Clear per-frame input state
         self.keys_pressed.clear();
         self.chars_pressed.clear();
@@ -921,10 +1025,11 @@ impl ViewerState {
                     display_zoom,
                 );
                 let line4 = {
-                    let c = self.cache.lock().unwrap();
-                    let cached = c.map.len();
-                    let used_mb = c.used_bytes as f64 / (1024.0 * 1024.0);
-                    let budget_mb = c.budget as f64 / (1024.0 * 1024.0);
+                    let (lock, _) = &*self.shared;
+                    let cs = lock.lock().unwrap();
+                    let cached = cs.images.len();
+                    let used_mb = cs.used_bytes as f64 / (1024.0 * 1024.0);
+                    let budget_mb = cs.budget as f64 / (1024.0 * 1024.0);
                     format!(
                         "cache: {}/{} images | {:.0}/{:.0} MB",
                         cached, self.files.len(), used_mb, budget_mb,
@@ -943,7 +1048,20 @@ impl ViewerState {
         } else if let Some(ref err) = self.error_message {
             let text_scale: u32 = 2;
             draw_text(frame, fb_w, fb_h, err, 20, fb_h as i32 / 2, text_scale, (255, 80, 80, 255));
-        } else if self.needs_load {
+        } else {
+            // Log cache state when showing Loading screen
+            {
+                let (lock, _) = &*self.shared;
+                let state = lock.lock().unwrap();
+                let cur = self.current_index;
+                let before = state.images.keys().filter(|&&k| k < cur).count();
+                let after = state.images.keys().filter(|&&k| k > cur).count();
+                let in_prog: Vec<usize> = state.in_progress.iter().copied().collect();
+                eprintln!(
+                    "[loading] idx={} cached_before={} cached_after={} total_cached={} in_progress={:?}",
+                    cur, before, after, state.images.len(), in_prog,
+                );
+            }
             let text_scale: u32 = 2;
             let tx = (fb_w as i32) / 2 - 30;
             draw_text(frame, fb_w, fb_h, "Loading...", tx, fb_h as i32 / 2, text_scale, (255, 255, 255, 255));
@@ -1012,7 +1130,7 @@ struct App {
     next_redraw: Option<Instant>,
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -1024,9 +1142,33 @@ impl ApplicationHandler for App {
         let context = softbuffer::Context::new(Arc::clone(&window)).expect("create context");
         let surface = Surface::new(&context, Arc::clone(&window)).expect("create surface");
 
+        window.request_redraw();
         self.window = Some(window);
         self.context = Some(context);
         self.surface = Some(surface);
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::ImageReady(idx) => {
+                if idx == self.state.current_index && self.state.current_decoded.is_none() {
+                    let (lock, _) = &*self.state.shared;
+                    let state = lock.lock().unwrap();
+                    if let Some(img) = state.get(idx) {
+                        drop(state);
+                        self.state.current_decoded = Some(img);
+                        self.state.error_message = None;
+                    } else if let Some(err) = state.errors.get(&idx) {
+                        let msg = format!("Could not load: {}", err);
+                        drop(state);
+                        self.state.error_message = Some(msg);
+                    }
+                    if let Some(ref window) = self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
+        }
     }
 
     fn window_event(
@@ -1148,7 +1290,7 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // Schedule next redraw only if continuous updates are needed
+                // Schedule next redraw only for key-hold repeat
                 let nav_keys_held = self.state.is_key_down_named(NamedKey::ArrowRight)
                     || self.state.is_key_down_named(NamedKey::ArrowLeft)
                     || self.state.is_key_down_named(NamedKey::Space)
@@ -1162,8 +1304,6 @@ impl ApplicationHandler for App {
                         (self.state.repeat_delay * 1000.0) as u64
                     };
                     self.next_redraw = Some(Instant::now() + Duration::from_millis(delay_ms.max(1)));
-                } else if self.state.needs_load {
-                    self.next_redraw = Some(Instant::now() + Duration::from_millis(16));
                 } else {
                     self.next_redraw = None;
                 }
@@ -1207,18 +1347,34 @@ fn main() {
         return;
     }
 
-    let cache: SharedCache = Arc::new(Mutex::new(ImageCache::new(budget)));
+    let files = Arc::new(files);
+    let file_count = files.len();
 
-    // Kick off initial loads
-    request_load(&cache, &files, 0);
-    prefetch(&cache, &files, 0);
+    let shared: SharedState = Arc::new((
+        Mutex::new(CacheState::new(budget, file_count)),
+        Condvar::new(),
+    ));
+
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(4, 16);
+
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("create event loop");
+    let proxy = event_loop.create_proxy();
+
+    // Spawn workers — they immediately start decoding from index 0 outward
+    spawn_decode_workers(Arc::clone(&shared), Arc::clone(&files), proxy, num_threads);
+    {
+        let (_, cvar) = &*shared;
+        cvar.notify_all();
+    }
 
     let initial_delay = cli.initial_delay as f64 / 1000.0;
     let repeat_delay = cli.repeat_delay as f64 / 1000.0;
 
-    let state = ViewerState::new(files, cache, initial_delay, repeat_delay);
+    let state = ViewerState::new(files, shared, initial_delay, repeat_delay);
 
-    let event_loop = EventLoop::new().expect("create event loop");
     let mut app = App {
         state,
         window: None,
