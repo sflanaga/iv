@@ -920,14 +920,25 @@ impl ViewerState {
                     ratio,
                     display_zoom,
                 );
+                let line4 = {
+                    let c = self.cache.lock().unwrap();
+                    let cached = c.map.len();
+                    let used_mb = c.used_bytes as f64 / (1024.0 * 1024.0);
+                    let budget_mb = c.budget as f64 / (1024.0 * 1024.0);
+                    format!(
+                        "cache: {}/{} images | {:.0}/{:.0} MB",
+                        cached, self.files.len(), used_mb, budget_mb,
+                    )
+                };
                 let text_scale: u32 = 2;
                 let line_h = (7 * text_scale + 4) as i32;
-                let bar_h = (line_h * 3 + 8) as u32;
+                let bar_h = (line_h * 4 + 8) as u32;
                 fill_rect(frame, fb_w, fb_h, 0, 0, fb_w, bar_h, (0, 0, 0, 178));
                 let white = (255, 255, 255, 255);
                 draw_text(frame, fb_w, fb_h, &line1, 10, 4, text_scale, white);
                 draw_text(frame, fb_w, fb_h, &line2, 10, 4 + line_h, text_scale, white);
                 draw_text(frame, fb_w, fb_h, &line3, 10, 4 + line_h * 2, text_scale, white);
+                draw_text(frame, fb_w, fb_h, &line4, 10, 4 + line_h * 3, text_scale, white);
             }
         } else if let Some(ref err) = self.error_message {
             let text_scale: u32 = 2;
