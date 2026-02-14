@@ -82,6 +82,22 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
+            UserEvent::FileListUpdated => {
+                // Update the file count in CacheState so workers know they can look further
+                let (lock, cvar) = &*self.state.shared;
+                let mut state = lock.lock().unwrap();
+                
+                let files_guard = self.state.files.read().unwrap();
+                state.file_count = files_guard.len();
+                drop(files_guard);
+                
+                // Wake up workers to check for new work (e.g. current_index might now be valid)
+                cvar.notify_all();
+                
+                if let Some(ref window) = self.window {
+                    window.request_redraw();
+                }
+            }
         }
     }
 

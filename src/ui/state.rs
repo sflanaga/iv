@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use winit::window::{Fullscreen, Window};
 use winit::keyboard::NamedKey;
@@ -24,7 +24,7 @@ const ZOOM_FACTOR: f32 = 0.25;
 // ---------------------------------------------------------------------------
 
 pub struct ViewerState {
-    pub files: Arc<Vec<PathBuf>>,
+    pub files: Arc<RwLock<Vec<PathBuf>>>,
     pub shared: SharedState,
     pub current_index: usize,
     /// The index of the image currently stored in `current_decoded`.
@@ -69,7 +69,7 @@ pub struct ViewerState {
 
 impl ViewerState {
     pub fn new(
-        files: Arc<Vec<PathBuf>>,
+        files: Arc<RwLock<Vec<PathBuf>>>,
         shared: SharedState,
         initial_delay: f64,
         repeat_delay: f64,
@@ -146,11 +146,15 @@ impl ViewerState {
         let mut nav = 0i32;
         let mut explicit_target: Option<usize> = None;
 
+        let files_guard = self.files.read().unwrap();
+        let files_len = files_guard.len();
+        drop(files_guard); // Drop lock early
+
         // Home / End
         if self.is_key_pressed_named(NamedKey::Home) {
             explicit_target = Some(0);
         } else if self.is_key_pressed_named(NamedKey::End) {
-             explicit_target = Some(self.files.len().saturating_sub(1));
+             explicit_target = Some(files_len.saturating_sub(1));
         }
 
         let fwd_down = self.is_key_down_named(NamedKey::ArrowRight)
@@ -211,8 +215,12 @@ impl ViewerState {
                 let new_idx = if let Some(t) = explicit_target {
                     t
                 } else {
-                    (self.current_index as i64 + nav as i64)
-                        .clamp(0, self.files.len() as i64 - 1) as usize
+                    if files_len == 0 {
+                        0
+                    } else {
+                        (self.current_index as i64 + nav as i64)
+                            .clamp(0, files_len as i64 - 1) as usize
+                    }
                 };
 
                 if new_idx != self.current_index {
@@ -390,8 +398,9 @@ impl ViewerState {
     }
 
     fn mark_current_file(&self) {
-        if self.current_index < self.files.len() {
-            let path = &self.files[self.current_index];
+        let files_guard = self.files.read().unwrap();
+        if self.current_index < files_guard.len() {
+            let path = &files_guard[self.current_index];
             if let Some(ref out_path) = self.marked_file_output {
                 // Append to file
                 match fs::OpenOptions::new().create(true).append(true).open(out_path) {
@@ -459,14 +468,23 @@ impl ViewerState {
                 } else {
                     0.0
                 };
+                
+                let files_guard = self.files.read().unwrap();
+                let files_len = files_guard.len();
+                let filename = if self.current_index < files_len {
+                    files_guard[self.current_index].display().to_string()
+                } else {
+                    "Loading...".to_string()
+                };
+                
                 let line1 = format!(
                     "[{}/{}]",
                     self.current_index + 1,
-                    self.files.len(),
+                    files_len,
                 );
                 let line2 = format!(
                     "{}",
-                    self.files[self.current_index].display(),
+                    filename,
                 );
                 let line3 = format!(
                     "{}x{} | {} | {:.1} KB | ratio {:.2} | zoom {:.0}%",
@@ -485,7 +503,7 @@ impl ViewerState {
                     let budget_mb = cs.budget as f64 / (1024.0 * 1024.0);
                     format!(
                         "cache: {}/{} images | {:.0}/{:.0} MB",
-                        cached, self.files.len(), used_mb, budget_mb,
+                        cached, files_len, used_mb, budget_mb,
                     )
                 };
                 let text_scale: u32 = 2;

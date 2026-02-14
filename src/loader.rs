@@ -2,7 +2,7 @@ use image::GenericImageView;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::Instant;
 use winit::event_loop::EventLoopProxy;
@@ -351,6 +351,7 @@ impl CacheState {
 #[derive(Debug)]
 pub enum UserEvent {
     ImageReady(usize),
+    FileListUpdated,
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +360,7 @@ pub enum UserEvent {
 
 pub fn spawn_decode_workers(
     shared: SharedState,
-    files: Arc<Vec<PathBuf>>,
+    files: Arc<RwLock<Vec<PathBuf>>>,
     proxy: EventLoopProxy<UserEvent>,
     num_threads: usize,
 ) {
@@ -384,47 +385,65 @@ pub fn spawn_decode_workers(
                 };
 
                 // Decode (no lock held — this is the slow part)
-                let t0 = Instant::now();
-                let result = decode_image(&files[idx]);
-                let elapsed = t0.elapsed();
+                // We must hold read lock on files just long enough to get the path
+                let path_opt = {
+                    let guard = files.read().unwrap();
+                    if idx < guard.len() {
+                        Some(guard[idx].clone())
+                    } else {
+                        None
+                    }
+                };
 
-                // Insert result and wake other workers
-                {
-                    let (lock, cvar) = &*shared;
+                if let Some(path) = path_opt {
+                    let t0 = Instant::now();
+                    let result = decode_image(&path);
+                    let elapsed = t0.elapsed();
+
+                    // Insert result and wake other workers
+                    {
+                        let (lock, cvar) = &*shared;
+                        let mut state = lock.lock().unwrap();
+                        state.in_progress.remove(&idx);
+                        match result {
+                            Ok(decoded) => {
+                                let bytes = decoded.rgba_bytes.len() as f64;
+                                let secs = elapsed.as_secs_f64();
+                                let mbps = if secs > 0.0 { bytes / secs / (1024.0 * 1024.0) } else { 0.0 };
+                                log::debug!(
+                                    "[decode] idx={} file={} {:.1}ms {:.1} MB/s",
+                                    idx,
+                                    path.file_name().unwrap_or_default().to_string_lossy(),
+                                    secs * 1000.0,
+                                    mbps,
+                                );
+                                state.insert(idx, decoded);
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "[decode] idx={} file={} FAILED: {}",
+                                    idx,
+                                    path.file_name().unwrap_or_default().to_string_lossy(),
+                                    e,
+                                );
+                                state.errors.insert(
+                                    idx,
+                                    format!("{}: {}", path.display(), e),
+                                );
+                            }
+                        }
+                        cvar.notify_all();
+                    }
+
+                    // Wake the UI
+                    let _ = proxy.send_event(UserEvent::ImageReady(idx));
+                } else {
+                    // Invalid index? Should not happen if CacheState is synced.
+                    // Just clear it from in_progress
+                    let (lock, _) = &*shared;
                     let mut state = lock.lock().unwrap();
                     state.in_progress.remove(&idx);
-                    match result {
-                        Ok(decoded) => {
-                            let bytes = decoded.rgba_bytes.len() as f64;
-                            let secs = elapsed.as_secs_f64();
-                            let mbps = if secs > 0.0 { bytes / secs / (1024.0 * 1024.0) } else { 0.0 };
-                            log::debug!(
-                                "[decode] idx={} file={} {:.1}ms {:.1} MB/s",
-                                idx,
-                                files[idx].file_name().unwrap_or_default().to_string_lossy(),
-                                secs * 1000.0,
-                                mbps,
-                            );
-                            state.insert(idx, decoded);
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "[decode] idx={} file={} FAILED: {}",
-                                idx,
-                                files[idx].file_name().unwrap_or_default().to_string_lossy(),
-                                e,
-                            );
-                            state.errors.insert(
-                                idx,
-                                format!("{}: {}", files[idx].display(), e),
-                            );
-                        }
-                    }
-                    cvar.notify_all();
                 }
-
-                // Wake the UI
-                let _ = proxy.send_event(UserEvent::ImageReady(idx));
             }
         });
     }
