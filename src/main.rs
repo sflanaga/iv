@@ -213,8 +213,18 @@ impl CacheState {
             && !self.saturated.contains(&idx)
     }
 
+    fn get_farthest_cached(&self) -> Option<(usize, usize)> {
+        self.images.keys()
+            .filter(|&&i| i != self.current_idx)
+            .map(|&i| {
+                let dist = if i >= self.current_idx { i - self.current_idx } else { self.current_idx - i };
+                (i, dist)
+            })
+            .max_by_key(|&(_, d)| d)
+    }
+
     /// Find the nearest un-cached, non-in-progress index to current_idx.
-    /// Spirals outward (+1, -1, +2, -2, ...). Returns None if nothing to do.
+    /// Prioritizes forward direction (2:1 ratio) to support read-ahead.
     fn find_work(&self) -> Option<usize> {
         // Always prioritize current_idx regardless of budget
         if self.current_idx < self.file_count
@@ -225,48 +235,146 @@ impl CacheState {
             return Some(self.current_idx);
         }
 
-        // For non-current images, respect budget.
-        // Be conservative: assume next image is average size.
         let avg = self.avg_image_size();
         let pending_bytes = self.in_progress.len() as u64 * avg;
-        if self.used_bytes + pending_bytes + avg > self.budget {
-            return None;
-        }
+        let predicted_usage = self.used_bytes + pending_bytes + avg;
+        let over_budget = predicted_usage > self.budget;
+        
+        // If over budget, we can only schedule if the new item is "closer" 
+        // than the farthest item we currently have (which would be evicted).
+        let farthest_dist = if over_budget {
+            self.get_farthest_cached().map(|(_, d)| d).unwrap_or(0)
+        } else {
+            usize::MAX
+        };
 
+        // Search pattern:
+        // 1. Immediate neighbors (+1, -1)
+        // 2. Then 2 forward, 1 backward, repeated.
+        
+        let mut fwd_dist = 1;
+        let mut bwd_dist = 1;
+        
         let mut stop_fwd = false;
         let mut stop_bwd = false;
 
-        for dist in 1..self.file_count {
-            if stop_fwd && stop_bwd {
-                break;
-            }
+        // Max scan distance to prevent scanning the whole drive if cache is tiny
+        const MAX_SCAN: usize = 2000; 
 
-            if !stop_fwd {
-                let fwd = self.current_idx + dist;
-                if fwd < self.file_count {
-                    if self.saturated.contains(&fwd) {
-                        stop_fwd = true;
-                        log::debug!("[find_work] Stop FWD at saturated idx={}", fwd);
-                    } else if self.is_available(fwd) {
-                        return Some(fwd);
-                    }
-                } else {
+        // Helper to check if a candidate is valid to schedule
+        let check_candidate = |idx: usize| -> Option<usize> {
+            if self.saturated.contains(&idx) {
+                // If it was saturated before, it won't fit now unless budget changed/moved
+                // But we clear saturated on move.
+                return None; // Stop search signal handled by caller via return check?
+                // Actually saturated means "too far/big".
+            }
+            if self.is_available(idx) {
+                let dist = if idx >= self.current_idx { idx - self.current_idx } else { self.current_idx - idx };
+                if !over_budget || dist < farthest_dist {
+                     return Some(idx);
+                }
+            }
+            None
+        };
+
+        // 1. Immediate neighbors
+        // Check +1
+        if fwd_dist < self.file_count && !stop_fwd {
+            let idx = self.current_idx + fwd_dist;
+            if idx < self.file_count {
+                if self.saturated.contains(&idx) {
                     stop_fwd = true;
+                    log::debug!("[find_work] Stop FWD at saturated idx={}", idx);
+                } else if let Some(found) = check_candidate(idx) {
+                    return Some(found);
+                } else if self.is_available(idx) {
+                    stop_fwd = true;
+                    log::debug!(
+                        "[find_work] Stop FWD at idx={} (dist={} over_budget={})", 
+                        idx, 
+                        if idx >= self.current_idx { idx - self.current_idx } else { self.current_idx - idx },
+                        over_budget
+                    );
                 }
+            } else {
+                stop_fwd = true;
+            }
+            fwd_dist += 1;
+        }
+        
+        // Check -1
+        if bwd_dist <= self.current_idx && !stop_bwd {
+            let idx = self.current_idx - bwd_dist;
+            if self.saturated.contains(&idx) {
+                stop_bwd = true;
+                log::debug!("[find_work] Stop BWD at saturated idx={}", idx);
+            } else if let Some(found) = check_candidate(idx) {
+                return Some(found);
+            } else if self.is_available(idx) {
+                 stop_bwd = true;
+                 log::debug!(
+                    "[find_work] Stop BWD at idx={} (dist={} over_budget={})", 
+                    idx, 
+                    if idx >= self.current_idx { idx - self.current_idx } else { self.current_idx - idx },
+                    over_budget
+                );
+            }
+            bwd_dist += 1;
+        }
+
+        // 2. Loop with bias
+        while (!stop_fwd && fwd_dist < MAX_SCAN) || (!stop_bwd && bwd_dist < MAX_SCAN) {
+             // 2 Forward
+            for _ in 0..2 {
+                if stop_fwd { break; }
+                let idx = self.current_idx + fwd_dist;
+                if idx >= self.file_count {
+                    stop_fwd = true;
+                } else {
+                    if self.saturated.contains(&idx) {
+                        stop_fwd = true;
+                        log::debug!("[find_work] Stop FWD at saturated idx={}", idx);
+                    } else if let Some(found) = check_candidate(idx) {
+                        return Some(found);
+                    } else if self.is_available(idx) {
+                        stop_fwd = true;
+                         log::debug!(
+                            "[find_work] Stop FWD at idx={} (dist={} over_budget={})", 
+                            idx, 
+                            if idx >= self.current_idx { idx - self.current_idx } else { self.current_idx - idx },
+                            over_budget
+                        );
+                    }
+                }
+                fwd_dist += 1;
             }
 
-            if !stop_bwd && dist <= self.current_idx {
-                let bwd = self.current_idx - dist;
-                if self.saturated.contains(&bwd) {
-                    stop_bwd = true;
-                    log::debug!("[find_work] Stop BWD at saturated idx={}", bwd);
-                } else if self.is_available(bwd) {
-                    return Some(bwd);
+            // 1 Backward
+            if !stop_bwd {
+                if bwd_dist > self.current_idx {
+                     stop_bwd = true;
+                } else {
+                    let idx = self.current_idx - bwd_dist;
+                    if self.saturated.contains(&idx) {
+                        stop_bwd = true;
+                        log::debug!("[find_work] Stop BWD at saturated idx={}", idx);
+                    } else if let Some(found) = check_candidate(idx) {
+                        return Some(found);
+                    } else if self.is_available(idx) {
+                        stop_bwd = true;
+                         log::debug!(
+                            "[find_work] Stop BWD at idx={} (dist={} over_budget={})", 
+                            idx, 
+                            if idx >= self.current_idx { idx - self.current_idx } else { self.current_idx - idx },
+                            over_budget
+                        );
+                    }
+                    bwd_dist += 1;
                 }
-            } else if dist > self.current_idx {
-                stop_bwd = true;
             }
         }
+        
         None
     }
 
@@ -376,6 +484,7 @@ fn spawn_decode_workers(
                     loop {
                         if let Some(idx) = state.find_work() {
                             state.in_progress.insert(idx);
+                            log::debug!("[schedule] Worker picked up idx={}", idx);
                             break idx;
                         }
                         state = cvar.wait(state).unwrap();
@@ -715,6 +824,9 @@ struct ViewerState {
     files: Arc<Vec<PathBuf>>,
     shared: SharedState,
     current_index: usize,
+    /// The index of the image currently stored in `current_decoded`.
+    /// May differ from `current_index` if we are waiting for a load.
+    displayed_index: usize,
     current_decoded: Option<Arc<DecodedImage>>,
     error_message: Option<String>,
 
@@ -758,6 +870,7 @@ impl ViewerState {
             files,
             shared,
             current_index: 0,
+            displayed_index: 0,
             current_decoded: None,
             error_message: None,
             zoom: 0.0,
@@ -852,16 +965,23 @@ impl ViewerState {
         }
 
         if nav != 0 {
-            // If current image is still loading, don't advance — poll cache instead
-            if self.current_decoded.is_none() && self.error_message.is_none() {
+            // If current image is still loading, don't advance — poll cache instead.
+            // Loading means we are waiting for the image at `current_index` to be ready.
+            let is_loading = self.displayed_index != self.current_index
+                || (self.current_decoded.is_none() && self.error_message.is_none());
+
+            if is_loading {
                 let (lock, cvar) = &*self.shared;
                 let mut state = lock.lock().unwrap();
                 // Ensure workers know our actual position
                 state.set_current_idx(self.current_index);
                 if let Some(img) = state.get(self.current_index) {
                     self.current_decoded = Some(img);
+                    self.displayed_index = self.current_index;
                 } else if let Some(err) = state.errors.get(&self.current_index) {
                     self.error_message = Some(format!("Could not load: {}", err));
+                    self.current_decoded = None;
+                    self.displayed_index = self.current_index;
                 }
                 cvar.notify_all();
                 // Don't advance yet — wait for current image
@@ -869,6 +989,12 @@ impl ViewerState {
                 let new_idx = (self.current_index as i64 + nav as i64)
                     .clamp(0, self.files.len() as i64 - 1) as usize;
                 if new_idx != self.current_index {
+                    log::debug!(
+                        "[nav] move {} -> {} (cache_hit={})",
+                        self.current_index,
+                        new_idx,
+                        self.shared.0.lock().unwrap().images.contains_key(&new_idx)
+                    );
                     self.current_index = new_idx;
                     self.error_message = None;
                     self.zoom = 0.0;
@@ -881,11 +1007,15 @@ impl ViewerState {
                     state.set_current_idx(new_idx);
                     if let Some(img) = state.get(new_idx) {
                         self.current_decoded = Some(img);
+                        self.displayed_index = new_idx;
                     } else if let Some(err) = state.errors.get(&new_idx) {
                         self.error_message = Some(format!("Could not load: {}", err));
                         self.current_decoded = None;
+                        self.displayed_index = new_idx;
                     } else {
-                        self.current_decoded = None;
+                        // Not in cache yet.
+                        // Keep current_decoded (old image) and displayed_index (old index)
+                        // to show the overlay.
                     }
                     cvar.notify_all();
                 }
@@ -1077,10 +1207,13 @@ impl ViewerState {
                 draw_text(frame, fb_w, fb_h, &line3, 10, 4 + line_h * 2, text_scale, white);
                 draw_text(frame, fb_w, fb_h, &line4, 10, 4 + line_h * 3, text_scale, white);
             }
-        } else if let Some(ref err) = self.error_message {
+        }
+
+        // Check for Error or Loading state overlays
+        if let Some(ref err) = self.error_message {
             let text_scale: u32 = 2;
             draw_text(frame, fb_w, fb_h, err, 20, fb_h as i32 / 2, text_scale, (255, 80, 80, 255));
-        } else {
+        } else if self.displayed_index != self.current_index || self.current_decoded.is_none() {
             // Log cache state when showing Loading screen
             {
                 let (lock, _) = &*self.shared;
@@ -1096,6 +1229,10 @@ impl ViewerState {
             }
             let text_scale: u32 = 2;
             let tx = (fb_w as i32) / 2 - 30;
+            // Draw a semi-transparent box behind "Loading..." if we have an image under it
+            if self.current_decoded.is_some() {
+                 fill_rect(frame, fb_w, fb_h, tx - 10, fb_h as i32 / 2 - 10, 140, 40, (0, 0, 0, 128));
+            }
             draw_text(frame, fb_w, fb_h, "Loading...", tx, fb_h as i32 / 2, text_scale, (255, 255, 255, 255));
         }
     }
@@ -1183,17 +1320,23 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::ImageReady(idx) => {
-                if idx == self.state.current_index && self.state.current_decoded.is_none() {
+                // If the ready image is the one we want to display
+                if idx == self.state.current_index {
                     let (lock, _) = &*self.state.shared;
                     let state = lock.lock().unwrap();
                     if let Some(img) = state.get(idx) {
                         drop(state);
                         self.state.current_decoded = Some(img);
+                        self.state.displayed_index = idx;
                         self.state.error_message = None;
                     } else if let Some(err) = state.errors.get(&idx) {
                         let msg = format!("Could not load: {}", err);
                         drop(state);
                         self.state.error_message = Some(msg);
+                        self.state.current_decoded = None; // clear old image on error? or keep it? 
+                        // Let's clear it so the error is visible on black background, 
+                        // or we could overlay error. For now, clear to match old behavior for errors.
+                        self.state.displayed_index = idx;
                     }
                     if let Some(ref window) = self.window {
                         window.request_redraw();
