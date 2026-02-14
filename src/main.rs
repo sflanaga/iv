@@ -3,6 +3,7 @@ use image::GenericImageView;
 use softbuffer::Surface;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -25,16 +26,41 @@ const IMAGE_EXTENSIONS: &[&str] = &[
     "pgm", "ppm", "pam", "dds", "hdr", "exr", "ff", "qoi",
 ];
 
+const HELP_KEYS: &str = "\
+Key Bindings:
+  Esc / q       : Quit
+  Left / h      : Previous image
+  Right / l     : Next image
+  Space         : Next image
+  f             : Toggle fullscreen
+  i             : Toggle info overlay
+  ?             : Toggle help overlay
+  r / R         : Rotate 90° CCW / CW
+  m             : Mark current file (write path to output)
+  z             : Toggle zoom (1:1 / Fit)
+  + / - / Wheel : Zoom in / out
+  Home          : Go to first image
+  End           : Go to last image
+";
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "iv", about = "A simple image viewer")]
+#[command(name = "iv", about = "A simple image viewer", after_help = HELP_KEYS)]
 struct Cli {
     /// Files or directories to view
-    #[arg(required = true)]
+    #[arg(required_unless_present = "file_list")]
     paths: Vec<PathBuf>,
+
+    /// Load file list from a text file (one path per line)
+    #[arg(short = 'L', long, value_name = "FILE")]
+    file_list: Option<PathBuf>,
+
+    /// Output file for marked images (appends path). Defaults to stdout if not set.
+    #[arg(short = 'o', long, value_name = "FILE")]
+    marked_file_output: Option<PathBuf>,
 
     /// Memory budget for image cache (e.g. 512MB, 2GB). Default: 10% of RAM.
     #[arg(short, long)]
@@ -81,8 +107,46 @@ fn is_image_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn collect_images(paths: &[PathBuf], recursive: bool) -> Vec<PathBuf> {
+fn collect_images(paths: &[PathBuf], file_list: Option<&PathBuf>, recursive: bool) -> Vec<PathBuf> {
     let mut result = Vec::new();
+    
+    // 1. Read from file list if provided
+    if let Some(list_path) = file_list {
+        if let Ok(file) = fs::File::open(list_path) {
+            let reader = io::BufReader::new(file);
+            for line in reader.lines() {
+                if let Ok(l) = line {
+                    // Split by tab first
+                    for tab_part in l.split('\t') {
+                        // Then by double-space (common column separator)
+                        for part in tab_part.split("  ") {
+                            let trimmed = part.trim();
+                            if trimmed.is_empty() { continue; }
+                            
+                            let p = PathBuf::from(trimmed);
+                            if p.is_file() {
+                                if is_image_file(&p) {
+                                    result.push(p);
+                                }
+                            } else {
+                                // If the chunk is not a file, maybe it's multiple single-space separated files?
+                                // Only try this if the chunk itself isn't a valid path, 
+                                // to avoid breaking "Copy of file.jpg".
+                                for sub in trimmed.split_whitespace() {
+                                    let sub_p = PathBuf::from(sub);
+                                    if sub_p.is_file() && is_image_file(&sub_p) {
+                                        result.push(sub_p);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Scan explicit paths
     for path in paths {
         if path.is_dir() {
             scan_dir(path, recursive, &mut result);
@@ -90,6 +154,11 @@ fn collect_images(paths: &[PathBuf], recursive: bool) -> Vec<PathBuf> {
             result.push(path.clone());
         }
     }
+    
+    // Remove duplicates? Maybe not needed if user wants specific order.
+    // But if we mixed directories and files, order might be weird.
+    // Let's keep it simple: just append.
+    
     result
 }
 
@@ -857,6 +926,11 @@ struct ViewerState {
 
     // Mouse wheel accumulator for this frame
     wheel_y: f32,
+
+    // Feature states
+    marked_file_output: Option<PathBuf>,
+    show_help: bool,
+    rotation: u8, // 0=0, 1=90, 2=180, 3=270 (CW)
 }
 
 impl ViewerState {
@@ -865,6 +939,7 @@ impl ViewerState {
         shared: SharedState,
         initial_delay: f64,
         repeat_delay: f64,
+        marked_file_output: Option<PathBuf>,
     ) -> Self {
         Self {
             files,
@@ -892,6 +967,9 @@ impl ViewerState {
             keys_pressed: HashSet::new(),
             chars_pressed: HashSet::new(),
             wheel_y: 0.0,
+            marked_file_output,
+            show_help: false,
+            rotation: 0,
         }
     }
 
@@ -932,6 +1010,15 @@ impl ViewerState {
         // Navigation
         // ------------------------------------------------------------------
         let mut nav = 0i32;
+        let mut explicit_target: Option<usize> = None;
+
+        // Home / End
+        if self.is_key_pressed_named(NamedKey::Home) {
+            explicit_target = Some(0);
+        } else if self.is_key_pressed_named(NamedKey::End) {
+             explicit_target = Some(self.files.len().saturating_sub(1));
+        }
+
         let fwd_down = self.is_key_down_named(NamedKey::ArrowRight)
             || self.is_key_down_named(NamedKey::Space)
             || self.is_char_down('l');
@@ -964,13 +1051,48 @@ impl ViewerState {
             self.nav_past_initial = false;
         }
 
-        if nav != 0 {
+        if nav != 0 || explicit_target.is_some() {
             // If current image is still loading, don't advance — poll cache instead.
             // Loading means we are waiting for the image at `current_index` to be ready.
             let is_loading = self.displayed_index != self.current_index
                 || (self.current_decoded.is_none() && self.error_message.is_none());
 
-            if is_loading {
+            // If we have an explicit target (Home/End), we might want to allow jumping 
+            // even if loading? For now let's keep it consistent: wait for load unless it's a huge jump?
+            // Actually, if we are loading index 5 and user hits Home (0), we should probably just go.
+            // But the architecture "poll cache" relies on current_index being the target.
+            // If we change current_index to 0, the worker logic will switch to 0.
+            // The only issue is the "loading overlay" logic which checks displayed vs current.
+            // If we change current to 0, and displayed is still 4 (old), it will show loading overlay.
+            // That is fine.
+            
+            // However, the block below says "if is_loading { don't advance }".
+            // We should probably allow changing target if it's an explicit jump, 
+            // OR if we are just scrolling. 
+            // But the problem with "if is_loading" is that it is the mechanism to POLL the cache.
+            // If we skip it, we update current_index, but we don't necessarily wait for the OLD one.
+            // We want to wait for the NEW one.
+            
+            // The logic:
+            // if is_loading { check if the WANTED image appeared }
+            // else { calculate NEW WANTED image }
+            
+            // If we have an explicit target, that IS the new wanted image.
+            // So we should update current_index to it.
+            
+            // But we can only do that if we are NOT waiting for the PREVIOUS move to finish?
+            // No, we can interrupt.
+            
+            // Let's see: 
+            // The existing code uses `is_loading` to BLOCK navigation inputs (`nav != 0`).
+            // It says "Don't advance yet".
+            // This is to prevent skipping over images too fast or getting out of sync?
+            // Or mostly to ensure we see the image before moving to the next.
+            
+            // If I hit Home, I definitely want to move.
+            // So I should arguably bypass the `is_loading` check for `explicit_target`.
+            
+            if is_loading && explicit_target.is_none() {
                 let (lock, cvar) = &*self.shared;
                 let mut state = lock.lock().unwrap();
                 // Ensure workers know our actual position
@@ -986,8 +1108,13 @@ impl ViewerState {
                 cvar.notify_all();
                 // Don't advance yet — wait for current image
             } else {
-                let new_idx = (self.current_index as i64 + nav as i64)
-                    .clamp(0, self.files.len() as i64 - 1) as usize;
+                let new_idx = if let Some(t) = explicit_target {
+                    t
+                } else {
+                    (self.current_index as i64 + nav as i64)
+                        .clamp(0, self.files.len() as i64 - 1) as usize
+                };
+
                 if new_idx != self.current_index {
                     log::debug!(
                         "[nav] move {} -> {} (cache_hit={})",
@@ -1027,6 +1154,36 @@ impl ViewerState {
         // ------------------------------------------------------------------
         if self.is_char_pressed('i') {
             self.show_info = !self.show_info;
+        }
+
+        // ------------------------------------------------------------------
+        // Toggle help
+        // ------------------------------------------------------------------
+        if self.is_char_pressed('?') {
+            self.show_help = !self.show_help;
+        }
+
+        // ------------------------------------------------------------------
+        // Mark file
+        // ------------------------------------------------------------------
+        if self.is_char_pressed('m') {
+            self.mark_current_file();
+        }
+
+        // ------------------------------------------------------------------
+        // Rotate
+        // ------------------------------------------------------------------
+        if self.is_char_pressed('r') {
+            self.rotation = (self.rotation + 1) % 4;
+            self.zoom = 0.0; // Reset zoom on rotate for simplicity
+            self.offset_x = 0.0;
+            self.offset_y = 0.0;
+        }
+        if self.is_char_pressed('R') {
+             self.rotation = (self.rotation + 3) % 4;
+             self.zoom = 0.0;
+             self.offset_x = 0.0;
+             self.offset_y = 0.0;
         }
 
         // ------------------------------------------------------------------
@@ -1125,6 +1282,28 @@ impl ViewerState {
         false
     }
 
+    fn mark_current_file(&self) {
+        if self.current_index < self.files.len() {
+            let path = &self.files[self.current_index];
+            if let Some(ref out_path) = self.marked_file_output {
+                // Append to file
+                match fs::OpenOptions::new().create(true).append(true).open(out_path) {
+                    Ok(mut file) => {
+                        if let Err(e) = writeln!(file, "{}", path.display()) {
+                            log::error!("Failed to write to mark file: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to open mark file: {}", e);
+                    }
+                }
+            } else {
+                // Write to stdout
+                println!("{}", path.display());
+            }
+        }
+    }
+
     /// Render into the softbuffer framebuffer (u32 per pixel, 0x00RRGGBB).
     fn render(&self, frame: &mut [u32], fb_w: u32, fb_h: u32) {
         // Clear to background color
@@ -1135,8 +1314,12 @@ impl ViewerState {
         let sh = fb_h as f32;
 
         if let Some(ref dec) = self.current_decoded {
-            let img_w = dec.width as f32;
-            let img_h = dec.height as f32;
+            // Adjust dimensions for rotation
+            let (img_w, img_h) = if self.rotation % 2 == 1 {
+                (dec.height as f32, dec.width as f32)
+            } else {
+                (dec.width as f32, dec.height as f32)
+            };
 
             let scale = if self.zoom == 0.0 {
                 fit_scale(img_w, img_h, sw, sh)
@@ -1149,10 +1332,11 @@ impl ViewerState {
             let x0 = (sw - draw_w) / 2.0 + self.offset_x;
             let y0 = (sh - draw_h) / 2.0 + self.offset_y;
 
-            blit_scaled(
+            blit_scaled_rotated(
                 frame, fb_w, fb_h,
                 &dec.rgba_bytes, dec.width, dec.height,
                 x0, y0, scale,
+                self.rotation,
             );
 
             // Info overlay
@@ -1214,19 +1398,7 @@ impl ViewerState {
             let text_scale: u32 = 2;
             draw_text(frame, fb_w, fb_h, err, 20, fb_h as i32 / 2, text_scale, (255, 80, 80, 255));
         } else if self.displayed_index != self.current_index || self.current_decoded.is_none() {
-            // Log cache state when showing Loading screen
-            {
-                let (lock, _) = &*self.shared;
-                let state = lock.lock().unwrap();
-                let cur = self.current_index;
-                let before = state.images.keys().filter(|&&k| k < cur).count();
-                let after = state.images.keys().filter(|&&k| k > cur).count();
-                let in_prog: Vec<usize> = state.in_progress.iter().copied().collect();
-                log::debug!(
-                    "[loading] idx={} cached_before={} cached_after={} total_cached={} in_progress={:?}",
-                    cur, before, after, state.images.len(), in_prog,
-                );
-            }
+             // ... existing loading log ...
             let text_scale: u32 = 2;
             let tx = (fb_w as i32) / 2 - 30;
             // Draw a semi-transparent box behind "Loading..." if we have an image under it
@@ -1235,21 +1407,36 @@ impl ViewerState {
             }
             draw_text(frame, fb_w, fb_h, "Loading...", tx, fb_h as i32 / 2, text_scale, (255, 255, 255, 255));
         }
+
+        // Help Overlay
+        if self.show_help {
+            fill_rect(frame, fb_w, fb_h, 0, 0, fb_w, fb_h, (0, 0, 0, 200));
+            let text_scale = 2;
+            let mut y = 20;
+            for line in HELP_KEYS.lines() {
+                draw_text(frame, fb_w, fb_h, line, 20, y, text_scale, (255, 255, 255, 255));
+                y += 24;
+            }
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Scaled blit (nearest-neighbor for simplicity and speed)
+// Scaled blit (nearest-neighbor) with rotation
 // ---------------------------------------------------------------------------
 
-fn blit_scaled(
+fn blit_scaled_rotated(
     dst: &mut [u32], dst_w: u32, dst_h: u32,
     src: &[u8], src_w: u32, src_h: u32,
     x0: f32, y0: f32, scale: f32,
+    rotation: u8,
 ) {
-    // Determine destination pixel range (clipped to framebuffer)
-    let draw_w = src_w as f32 * scale;
-    let draw_h = src_h as f32 * scale;
+    let (draw_w, draw_h) = if rotation % 2 == 1 {
+        (src_h as f32 * scale, src_w as f32 * scale)
+    } else {
+        (src_w as f32 * scale, src_h as f32 * scale)
+    };
+
     let dx_start = (x0.max(0.0)) as u32;
     let dy_start = (y0.max(0.0)) as u32;
     let dx_end = ((x0 + draw_w).ceil() as u32).min(dst_w);
@@ -1258,20 +1445,29 @@ fn blit_scaled(
     let inv_scale = 1.0 / scale;
 
     for dy in dy_start..dy_end {
-        let sy = ((dy as f32 - y0) * inv_scale) as u32;
-        if sy >= src_h {
-            continue;
-        }
-        let src_row = (sy * src_w) as usize;
-        let dst_row = (dy * dst_w) as usize;
+        let vy = (dy as f32 - y0) * inv_scale;
         for dx in dx_start..dx_end {
-            let sx = ((dx as f32 - x0) * inv_scale) as u32;
-            if sx >= src_w {
+            let vx = (dx as f32 - x0) * inv_scale;
+
+            // Map (vx, vy) back to source coordinates based on rotation
+            // Source dims are (src_w, src_h)
+            // (vx, vy) are in the rotated space (0..draw_w/scale, 0..draw_h/scale)
+            let (sx, sy) = match rotation {
+                0 => (vx as u32, vy as u32),
+                1 => ((src_w as f32 - 1.0 - vy) as u32, vx as u32), // 90 CCW
+                2 => ((src_w as f32 - 1.0 - vx) as u32, (src_h as f32 - 1.0 - vy) as u32), // 180
+                3 => (vy as u32, (src_h as f32 - 1.0 - vx) as u32), // 270 CCW (90 CW)
+                _ => (vx as u32, vy as u32),
+            };
+
+            if sx >= src_w || sy >= src_h {
                 continue;
             }
-            let si = (src_row + sx as usize) * 4;
-            let di = dst_row + dx as usize;
-            // Source is RGBA u8, destination is 0x00RRGGBB u32
+
+            let si = (sy as usize * src_w as usize + sx as usize) * 4;
+            let di = dy as usize * dst_w as usize + dx as usize;
+
+            // ... pixel copy ...
             let sa = src[si + 3] as u32;
             if sa == 255 {
                 dst[di] = rgb(src[si], src[si + 1], src[si + 2]);
@@ -1517,7 +1713,7 @@ fn main() {
         None => default_memory_budget(),
     };
 
-    let files = collect_images(&cli.paths, cli.recursive);
+    let files = collect_images(&cli.paths, cli.file_list.as_ref(), cli.recursive);
     if files.is_empty() {
         log::error!("No image files found.");
         return;
@@ -1549,7 +1745,13 @@ fn main() {
     let initial_delay = cli.initial_delay as f64 / 1000.0;
     let repeat_delay = cli.repeat_delay as f64 / 1000.0;
 
-    let state = ViewerState::new(files, shared, initial_delay, repeat_delay);
+    let state = ViewerState::new(
+        files, 
+        shared, 
+        initial_delay, 
+        repeat_delay, 
+        cli.marked_file_output
+    );
 
     let mut app = App {
         state,
