@@ -8,7 +8,7 @@ use winit::window::{Fullscreen, Window};
 use winit::keyboard::NamedKey;
 
 use crate::cli::HELP_KEYS;
-use crate::loader::{DecodedImage, SharedState};
+use crate::loader::{DecodedImage, SharedState, ViewMode};
 use crate::ui::render::{
     blit_scaled_rotated, draw_text, fill_rect, fit_scale, rgb, BG_COLOR,
 };
@@ -18,6 +18,7 @@ use crate::ui::render::{
 // ---------------------------------------------------------------------------
 
 const ZOOM_FACTOR: f32 = 0.25;
+const GRID_COLS: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Viewer state
@@ -32,6 +33,8 @@ pub struct ViewerState {
     pub displayed_index: usize,
     pub current_decoded: Option<Arc<DecodedImage>>,
     pub error_message: Option<String>,
+
+    pub view_mode: ViewMode,
 
     pub zoom: f32, // 0.0 = fit to window
     pub offset_x: f32,
@@ -82,6 +85,7 @@ impl ViewerState {
             displayed_index: 0,
             current_decoded: None,
             error_message: None,
+            view_mode: ViewMode::Single,
             zoom: 0.0,
             offset_x: 0.0,
             offset_y: 0.0,
@@ -141,9 +145,33 @@ impl ViewerState {
         }
 
         // ------------------------------------------------------------------
+        // Toggle Mode (t)
+        // ------------------------------------------------------------------
+        if self.is_char_pressed('t') {
+            self.view_mode = match self.view_mode {
+                ViewMode::Single => ViewMode::Grid,
+                ViewMode::Grid => ViewMode::Single,
+            };
+            
+            // Notify loader of mode change
+            let (lock, cvar) = &*self.shared;
+            let mut state = lock.lock().unwrap();
+            state.set_mode(self.view_mode);
+            cvar.notify_all();
+
+            // Reset view params
+            self.zoom = 0.0;
+            self.offset_x = 0.0;
+            self.offset_y = 0.0;
+            
+            // Force redraw logic to pick up new mode
+            window.request_redraw();
+        }
+
+        // ------------------------------------------------------------------
         // Navigation
         // ------------------------------------------------------------------
-        let mut nav = 0i32;
+        let nav;
         let mut explicit_target: Option<usize> = None;
 
         let files_guard = self.files.read().unwrap();
@@ -157,61 +185,121 @@ impl ViewerState {
              explicit_target = Some(files_len.saturating_sub(1));
         }
 
+        // Arrow keys / WASD / HJKL
         let fwd_down = self.is_key_down_named(NamedKey::ArrowRight)
             || self.is_key_down_named(NamedKey::Space)
             || self.is_char_down('l');
         let bwd_down = self.is_key_down_named(NamedKey::ArrowLeft)
             || self.is_char_down('h');
+        let up_down = self.is_key_down_named(NamedKey::ArrowUp)
+            || self.is_char_down('k');
+        let down_down = self.is_key_down_named(NamedKey::ArrowDown)
+            || self.is_char_down('j');
+        
         let fwd_pressed = self.is_key_pressed_named(NamedKey::ArrowRight)
             || self.is_key_pressed_named(NamedKey::Space)
             || self.is_char_pressed('l');
         let bwd_pressed = self.is_key_pressed_named(NamedKey::ArrowLeft)
             || self.is_char_pressed('h');
+        let up_pressed = self.is_key_pressed_named(NamedKey::ArrowUp)
+            || self.is_char_pressed('k');
+        let down_pressed = self.is_key_pressed_named(NamedKey::ArrowDown)
+            || self.is_char_pressed('j');
+            
+        let pgup_pressed = self.is_key_pressed_named(NamedKey::PageUp);
+        let pgdn_pressed = self.is_key_pressed_named(NamedKey::PageDown);
 
-        if fwd_pressed || bwd_pressed {
-            nav = if fwd_pressed { 1 } else { -1 };
-            self.nav_hold_timer = 0.0;
-            self.nav_past_initial = false;
-        } else if fwd_down || bwd_down {
-            self.nav_hold_timer += dt;
-            if !self.nav_past_initial {
-                if self.nav_hold_timer >= self.initial_delay {
-                    nav = if fwd_down { 1 } else { -1 };
-                    self.nav_hold_timer = 0.0;
-                    self.nav_past_initial = true;
-                }
-            } else if self.nav_hold_timer >= self.repeat_delay {
-                nav = if fwd_down { 1 } else { -1 };
-                self.nav_hold_timer -= self.repeat_delay;
+        let any_nav_down = fwd_down || bwd_down || up_down || down_down;
+
+        // Calculate nav delta
+        let mut delta = 0i32;
+
+        if self.view_mode == ViewMode::Grid {
+            // Grid Navigation
+            if fwd_pressed { delta += 1; }
+            if bwd_pressed { delta -= 1; }
+            if down_pressed { delta += GRID_COLS as i32; }
+            if up_pressed { delta -= GRID_COLS as i32; }
+            
+            if pgdn_pressed {
+                // Approximate page height? Let's say 15 rows
+                delta += (GRID_COLS * 15) as i32;
             }
+            if pgup_pressed {
+                delta -= (GRID_COLS * 15) as i32;
+            }
+
+            // Key repeat for grid?
+            if delta == 0 && any_nav_down {
+                 self.nav_hold_timer += dt;
+                if !self.nav_past_initial {
+                    if self.nav_hold_timer >= self.initial_delay {
+                         self.nav_hold_timer = 0.0;
+                         self.nav_past_initial = true;
+                         // Trigger repeat
+                         if fwd_down { delta += 1; }
+                         if bwd_down { delta -= 1; }
+                         if down_down { delta += GRID_COLS as i32; }
+                         if up_down { delta -= GRID_COLS as i32; }
+                    }
+                } else if self.nav_hold_timer >= self.repeat_delay {
+                    self.nav_hold_timer -= self.repeat_delay;
+                     if fwd_down { delta += 1; }
+                     if bwd_down { delta -= 1; }
+                     if down_down { delta += GRID_COLS as i32; }
+                     if up_down { delta -= GRID_COLS as i32; }
+                }
+            } else if !any_nav_down {
+                 self.nav_hold_timer = 0.0;
+                 self.nav_past_initial = false;
+            }
+            
+            nav = delta;
+
         } else {
-            self.nav_hold_timer = 0.0;
-            self.nav_past_initial = false;
+            // Single View Navigation
+            // Only Left/Right supported
+             if fwd_pressed { delta = 1; }
+             if bwd_pressed { delta = -1; }
+             
+             if pgdn_pressed { delta = 1; } // PgDn -> Next
+             if pgup_pressed { delta = -1; } // PgUp -> Prev
+
+             if delta != 0 {
+                self.nav_hold_timer = 0.0;
+                self.nav_past_initial = false;
+             } else if fwd_down || bwd_down {
+                self.nav_hold_timer += dt;
+                if !self.nav_past_initial {
+                    if self.nav_hold_timer >= self.initial_delay {
+                        delta = if fwd_down { 1 } else { -1 };
+                        self.nav_hold_timer = 0.0;
+                        self.nav_past_initial = true;
+                    }
+                } else if self.nav_hold_timer >= self.repeat_delay {
+                    delta = if fwd_down { 1 } else { -1 };
+                    self.nav_hold_timer -= self.repeat_delay;
+                }
+            } else {
+                self.nav_hold_timer = 0.0;
+                self.nav_past_initial = false;
+            }
+            nav = delta;
         }
 
         if nav != 0 || explicit_target.is_some() {
-            // If current image is still loading, don't advance — poll cache instead.
-            // Loading means we are waiting for the image at `current_index` to be ready.
-            let is_loading = self.displayed_index != self.current_index
-                || (self.current_decoded.is_none() && self.error_message.is_none());
+            // In Grid mode, we don't wait for loading. We just move selection.
+            // In Single mode, we might wait for loading (existing logic).
+            let is_loading = self.view_mode == ViewMode::Single && (
+                self.displayed_index != self.current_index
+                || (self.current_decoded.is_none() && self.error_message.is_none())
+            );
 
-            // If we have an explicit target (Home/End), we bypass loading check
-            if is_loading && explicit_target.is_none() {
-                let (lock, cvar) = &*self.shared;
-                let mut state = lock.lock().unwrap();
-                // Ensure workers know our actual position
-                state.set_current_idx(self.current_index);
-                if let Some(img) = state.get(self.current_index) {
-                    self.current_decoded = Some(img);
-                    self.displayed_index = self.current_index;
-                } else if let Some(err) = state.errors.get(&self.current_index) {
-                    self.error_message = Some(format!("Could not load: {}", err));
-                    self.current_decoded = None;
-                    self.displayed_index = self.current_index;
-                }
-                cvar.notify_all();
-                // Don't advance yet — wait for current image
-            } else {
+            // Bypass loading check if Grid mode OR explicit target OR we decided to allow skipping
+            // User probably wants snappy navigation in Grid mode.
+            let can_move = self.view_mode == ViewMode::Grid || !is_loading || explicit_target.is_some();
+
+            if can_move {
                 let new_idx = if let Some(t) = explicit_target {
                     t
                 } else {
@@ -224,36 +312,44 @@ impl ViewerState {
                 };
 
                 if new_idx != self.current_index {
-                    log::debug!(
-                        "[nav] move {} -> {} (cache_hit={})",
-                        self.current_index,
-                        new_idx,
-                        self.shared.0.lock().unwrap().images.contains_key(&new_idx)
-                    );
                     self.current_index = new_idx;
                     self.error_message = None;
-                    self.zoom = 0.0;
-                    self.offset_x = 0.0;
-                    self.offset_y = 0.0;
+                    
+                    if self.view_mode == ViewMode::Single {
+                         self.zoom = 0.0;
+                         self.offset_x = 0.0;
+                         self.offset_y = 0.0;
+                    }
 
                     // Update shared state and wake workers
                     let (lock, cvar) = &*self.shared;
                     let mut state = lock.lock().unwrap();
                     state.set_current_idx(new_idx);
-                    if let Some(img) = state.get(new_idx) {
-                        self.current_decoded = Some(img);
-                        self.displayed_index = new_idx;
-                    } else if let Some(err) = state.errors.get(&new_idx) {
-                        self.error_message = Some(format!("Could not load: {}", err));
-                        self.current_decoded = None;
-                        self.displayed_index = new_idx;
-                    } else {
-                        // Not in cache yet.
-                        // Keep current_decoded (old image) and displayed_index (old index)
-                        // to show the overlay.
+                    
+                    if self.view_mode == ViewMode::Single {
+                        if let Some(img) = state.get(new_idx) {
+                            self.current_decoded = Some(img);
+                            self.displayed_index = new_idx;
+                        } else if let Some(err) = state.errors.get(&new_idx) {
+                            self.error_message = Some(format!("Could not load: {}", err));
+                            self.current_decoded = None;
+                            self.displayed_index = new_idx;
+                        }
                     }
+                    // For Grid mode, we don't update `current_decoded` because we render from cache directly
+                    
                     cvar.notify_all();
                 }
+            } else if is_loading && explicit_target.is_none() {
+                 // Check if current became available?
+                let (lock, cvar) = &*self.shared;
+                let mut state = lock.lock().unwrap();
+                state.set_current_idx(self.current_index);
+                if let Some(img) = state.get(self.current_index) {
+                    self.current_decoded = Some(img);
+                    self.displayed_index = self.current_index;
+                }
+                cvar.notify_all();
             }
         }
 
@@ -310,18 +406,7 @@ impl ViewerState {
         }
 
         // ------------------------------------------------------------------
-        // Zoom: z = 1:1 toggle (was 'z') -- wait code says 'r' is fit to window in comments? 
-        // No, loop above 'r' is rotate.
-        // Old code:
-        // if self.is_char_pressed('r') { zoom=0.0; ... } -> This was probably remnants or re-use.
-        // But 'r' is rotate now.
-        // Let's check original code logic again.
-        // "Zoom: r = fit to window, z = 1:1" comment in old code.
-        // But we added rotation on 'r'.
-        // So 'r' now rotates.
-        // 'z' toggles zoom.
-        // Let's remove 'r' for reset zoom, or bind it to something else? 
-        // Or just let 'z' handle it.
+        // Zoom: z = 1:1 toggle (was 'z')
         // ------------------------------------------------------------------
         
         if self.is_char_pressed('z') {
@@ -425,7 +510,100 @@ impl ViewerState {
         // Clear to background color
         let bg = rgb(BG_COLOR[0], BG_COLOR[1], BG_COLOR[2]);
         frame.fill(bg);
+        
+        match self.view_mode {
+            ViewMode::Single => self.render_single(frame, fb_w, fb_h),
+            ViewMode::Grid => self.render_grid(frame, fb_w, fb_h),
+        }
+    }
 
+    fn render_grid(&self, frame: &mut [u32], fb_w: u32, fb_h: u32) {
+        let cols = GRID_COLS;
+        let thumb_w = fb_w as usize / cols;
+        let thumb_h = thumb_w; // Square cells
+        
+        if thumb_w == 0 { return; }
+        
+        let rows_visible = (fb_h as usize + thumb_h - 1) / thumb_h + 1;
+        let items_per_page = cols * rows_visible;
+        
+        // Calculate scroll offset to keep current_index visible
+        // We want current_index row to be roughly centered or at least visible
+        let cur_row = self.current_index / cols;
+        
+        // Simple scrolling: keep current row in the middle
+        let center_row = rows_visible / 2;
+        let start_row = cur_row.saturating_sub(center_row);
+        let start_index = start_row * cols;
+        
+        // Lock shared state to get thumbnails
+        let (lock, _) = &*self.shared;
+        let state = lock.lock().unwrap();
+        
+        let files_guard = self.files.read().unwrap();
+        let files_len = files_guard.len();
+        drop(files_guard);
+
+        for i in 0..items_per_page {
+            let idx = start_index + i;
+            if idx >= files_len { break; }
+            
+            let row = (idx / cols) - start_row;
+            let col = idx % cols;
+            
+            let x = (col * thumb_w) as i32;
+            let y = (row * thumb_h) as i32;
+            
+            if y >= fb_h as i32 { break; }
+            
+            // Highlight selection
+            if idx == self.current_index {
+                fill_rect(frame, fb_w, fb_h, x, y, thumb_w as u32, thumb_h as u32, (100, 100, 100, 255));
+            }
+            
+            // Draw thumbnail
+            if let Some(dec) = state.get_thumbnail(idx) {
+                // Scale thumbnail to fit cell
+                let scale = fit_scale(dec.width as f32, dec.height as f32, thumb_w as f32, thumb_h as f32);
+                let draw_w = dec.width as f32 * scale;
+                let draw_h = dec.height as f32 * scale;
+                
+                let dx = x as f32 + (thumb_w as f32 - draw_w) / 2.0;
+                let dy = y as f32 + (thumb_h as f32 - draw_h) / 2.0;
+                
+                blit_scaled_rotated(
+                    frame, fb_w, fb_h, 
+                    &dec.rgba_bytes, dec.width, dec.height,
+                    dx, dy, scale, 
+                    0 // No rotation in grid for now
+                );
+            } else {
+                // Placeholder for loading/missing
+                let gap = 4;
+                if thumb_w > 2 * gap && thumb_h > 2 * gap {
+                    fill_rect(
+                        frame, fb_w, fb_h, 
+                        x + gap as i32, y + gap as i32, 
+                        (thumb_w as u32).saturating_sub((2 * gap) as u32), 
+                        (thumb_h as u32).saturating_sub((2 * gap) as u32), 
+                        (50, 50, 50, 255)
+                    );
+                }
+            }
+            
+            // Draw border for selection?
+            if idx == self.current_index {
+                 // Simple border by filling rects
+                 let border_color = (200, 200, 255, 255);
+                 fill_rect(frame, fb_w, fb_h, x, y, thumb_w as u32, 2, border_color); // Top
+                 fill_rect(frame, fb_w, fb_h, x, y + thumb_h as i32 - 2, thumb_w as u32, 2, border_color); // Bottom
+                 fill_rect(frame, fb_w, fb_h, x, y, 2, thumb_h as u32, border_color); // Left
+                 fill_rect(frame, fb_w, fb_h, x + thumb_w as i32 - 2, y, 2, thumb_h as u32, border_color); // Right
+            }
+        }
+    }
+
+    fn render_single(&self, frame: &mut [u32], fb_w: u32, fb_h: u32) {
         let sw = fb_w as f32;
         let sh = fb_h as f32;
 

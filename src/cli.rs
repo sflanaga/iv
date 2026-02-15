@@ -8,6 +8,7 @@ Key Bindings:
   Right / l     : Next image
   Space         : Next image
   f             : Toggle fullscreen
+  t             : Toggle thumbnail view
   i             : Toggle info overlay
   ?             : Toggle help overlay
   r / R         : Rotate 90° CCW / CW

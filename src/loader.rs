@@ -4,7 +4,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
-use std::time::Instant;
 use winit::event_loop::EventLoopProxy;
 
 // ---------------------------------------------------------------------------
@@ -25,39 +24,74 @@ impl DecodedImage {
     }
 }
 
-fn decode_image(path: &Path) -> Result<DecodedImage, String> {
+fn decode_image(path: &Path, target_size: Option<(u32, u32)>) -> Result<DecodedImage, String> {
     let file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let img = image::open(path).map_err(|e| format!("{}", e))?;
-    let (width, height) = img.dimensions();
-    let format_name = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("unknown")
-        .to_uppercase();
-    let rgba = img.to_rgba8();
-    Ok(DecodedImage {
-        rgba_bytes: rgba.into_raw(),
-        width,
-        height,
-        file_size,
-        format_name,
-    })
+    let img_result = image::open(path);
+    
+    match img_result {
+        Ok(img) => {
+            let format_name = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("unknown")
+                .to_uppercase();
+
+            let final_img = if let Some((w, h)) = target_size {
+                img.thumbnail(w, h)
+            } else {
+                img
+            };
+            
+            let (f_width, f_height) = final_img.dimensions();
+            let rgba = final_img.to_rgba8();
+            
+            Ok(DecodedImage {
+                rgba_bytes: rgba.into_raw(),
+                width: f_width,
+                height: f_height,
+                file_size,
+                format_name,
+            })
+        }
+        Err(e) => Err(format!("{}", e)),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Cache state (shared between UI and worker threads via Mutex + Condvar)
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ViewMode {
+    Single,
+    Grid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WorkType {
+    Full,
+    Thumbnail,
+}
+
 pub struct CacheState {
     pub current_idx: usize,
+    pub mode: ViewMode,
+    
+    // Caches
     pub images: HashMap<usize, Arc<DecodedImage>>,
-    pub in_progress: HashSet<usize>,
-    pub errors: HashMap<usize, String>,
+    pub thumbnails: HashMap<usize, Arc<DecodedImage>>,
+    
+    // Work tracking
+    pub in_progress: HashSet<(usize, WorkType)>,
+    pub errors: HashMap<usize, String>, // Full load errors
+    pub thumbnail_errors: HashSet<usize>, // Thumbnail load errors (simple set)
+    
+    // Budget
     pub used_bytes: u64,
     pub budget: u64,
     pub file_count: usize,
+    
     /// Indices that were decoded but couldn't be kept (cache full, too far).
-    /// Cleared when current_idx changes so they can be re-evaluated.
     pub saturated: HashSet<usize>,
 }
 
@@ -67,9 +101,12 @@ impl CacheState {
     pub fn new(budget: u64, file_count: usize) -> Self {
         Self {
             current_idx: 0,
+            mode: ViewMode::Single,
             images: HashMap::new(),
+            thumbnails: HashMap::new(),
             in_progress: HashSet::new(),
             errors: HashMap::new(),
+            thumbnail_errors: HashSet::new(),
             used_bytes: 0,
             budget,
             file_count,
@@ -83,9 +120,19 @@ impl CacheState {
             self.saturated.clear();
         }
     }
+    
+    pub fn set_mode(&mut self, mode: ViewMode) {
+        self.mode = mode;
+        // Should we clear in_progress or caches? 
+        // For now, keep them. Transition might be smoother.
+    }
 
     pub fn get(&self, idx: usize) -> Option<Arc<DecodedImage>> {
         self.images.get(&idx).cloned()
+    }
+    
+    pub fn get_thumbnail(&self, idx: usize) -> Option<Arc<DecodedImage>> {
+        self.thumbnails.get(&idx).cloned()
     }
 
     /// Average decoded image size in bytes (fallback: ~8 MB).
@@ -93,16 +140,25 @@ impl CacheState {
         if self.images.is_empty() {
             8 * 1024 * 1024
         } else {
-            self.used_bytes / self.images.len() as u64
+            self.used_bytes.max(1) / self.images.len().max(1) as u64
         }
     }
 
-    pub fn is_available(&self, idx: usize) -> bool {
-        idx < self.file_count
-            && !self.images.contains_key(&idx)
-            && !self.in_progress.contains(&idx)
-            && !self.errors.contains_key(&idx)
-            && !self.saturated.contains(&idx)
+    pub fn is_available(&self, idx: usize, wtype: WorkType) -> bool {
+        if idx >= self.file_count { return false; }
+        if self.in_progress.contains(&(idx, wtype)) { return false; }
+        
+        match wtype {
+            WorkType::Full => {
+                !self.images.contains_key(&idx) 
+                && !self.errors.contains_key(&idx)
+                && !self.saturated.contains(&idx)
+            },
+            WorkType::Thumbnail => {
+                !self.thumbnails.contains_key(&idx)
+                && !self.thumbnail_errors.contains(&idx)
+            }
+        }
     }
 
     fn get_farthest_cached(&self) -> Option<(usize, usize)> {
@@ -116,102 +172,66 @@ impl CacheState {
     }
 
     /// Find the nearest un-cached, non-in-progress index to current_idx.
-    /// Prioritizes forward direction (2:1 ratio) to support read-ahead.
-    pub fn find_work(&self) -> Option<usize> {
-        // Always prioritize current_idx regardless of budget
-        if self.current_idx < self.file_count
-            && !self.images.contains_key(&self.current_idx)
-            && !self.in_progress.contains(&self.current_idx)
-            && !self.errors.contains_key(&self.current_idx)
-        {
-            return Some(self.current_idx);
+    pub fn find_work(&self) -> Option<(usize, WorkType)> {
+        match self.mode {
+            ViewMode::Single => self.find_work_single(),
+            ViewMode::Grid => self.find_work_grid(),
+        }
+    }
+
+    fn find_work_single(&self) -> Option<(usize, WorkType)> {
+        // Always prioritize current_idx full load
+        if self.is_available(self.current_idx, WorkType::Full) {
+            return Some((self.current_idx, WorkType::Full));
         }
 
+        // Standard prefetch logic for single view
         let avg = self.avg_image_size();
-        let pending_bytes = self.in_progress.len() as u64 * avg;
+        let pending_bytes = self.in_progress.iter()
+            .filter(|(_, t)| *t == WorkType::Full)
+            .count() as u64 * avg;
+            
         let predicted_usage = self.used_bytes + pending_bytes + avg;
         let over_budget = predicted_usage > self.budget;
         
-        // If over budget, we can only schedule if the new item is "closer" 
-        // than the farthest item we currently have (which would be evicted).
         let farthest_dist = if over_budget {
             self.get_farthest_cached().map(|(_, d)| d).unwrap_or(0)
         } else {
             usize::MAX
         };
 
-        // Search pattern:
-        // 1. Immediate neighbors (+1, -1)
-        // 2. Then 2 forward, 1 backward, repeated.
+        const MAX_SCAN: usize = 2000; 
         
         let mut fwd_dist = 1;
         let mut bwd_dist = 1;
-        
         let mut stop_fwd = false;
         let mut stop_bwd = false;
 
-        // Max scan distance to prevent scanning the whole drive if cache is tiny
-        const MAX_SCAN: usize = 2000; 
-
-        // Helper to check if a candidate is valid to schedule
-        let check_candidate = |idx: usize| -> Option<usize> {
+        let check_candidate = |idx: usize| -> Option<(usize, WorkType)> {
             if self.saturated.contains(&idx) {
-                // If it was saturated before, it won't fit now unless budget changed/moved
-                // But we clear saturated on move.
-                return None; // Stop search signal handled by caller via return check?
-                // Actually saturated means "too far/big".
+                return None;
             }
-            if self.is_available(idx) {
+            if self.is_available(idx, WorkType::Full) {
                 let dist = if idx >= self.current_idx { idx - self.current_idx } else { self.current_idx - idx };
                 if !over_budget || dist < farthest_dist {
-                     return Some(idx);
+                     return Some((idx, WorkType::Full));
                 }
             }
             None
         };
 
         // 1. Immediate neighbors
-        // Check +1
-        if fwd_dist < self.file_count && !stop_fwd {
+        if fwd_dist < self.file_count {
             let idx = self.current_idx + fwd_dist;
             if idx < self.file_count {
-                if self.saturated.contains(&idx) {
-                    stop_fwd = true;
-                    log::debug!("[find_work] Stop FWD at saturated idx={}", idx);
-                } else if let Some(found) = check_candidate(idx) {
-                    return Some(found);
-                } else if self.is_available(idx) {
-                    stop_fwd = true;
-                    log::debug!(
-                        "[find_work] Stop FWD at idx={} (dist={} over_budget={})", 
-                        idx, 
-                        if idx >= self.current_idx { idx - self.current_idx } else { self.current_idx - idx },
-                        over_budget
-                    );
-                }
-            } else {
-                stop_fwd = true;
+                if let Some(res) = check_candidate(idx) { return Some(res); }
             }
             fwd_dist += 1;
         }
         
-        // Check -1
-        if bwd_dist <= self.current_idx && !stop_bwd {
+        if bwd_dist <= self.current_idx {
             let idx = self.current_idx - bwd_dist;
-            if self.saturated.contains(&idx) {
-                stop_bwd = true;
-                log::debug!("[find_work] Stop BWD at saturated idx={}", idx);
-            } else if let Some(found) = check_candidate(idx) {
-                return Some(found);
-            } else if self.is_available(idx) {
-                 stop_bwd = true;
-                 log::debug!(
-                    "[find_work] Stop BWD at idx={} (dist={} over_budget={})", 
-                    idx, 
-                    if idx >= self.current_idx { idx - self.current_idx } else { self.current_idx - idx },
-                    over_budget
-                );
-            }
+             if let Some(res) = check_candidate(idx) { return Some(res); }
             bwd_dist += 1;
         }
 
@@ -226,17 +246,10 @@ impl CacheState {
                 } else {
                     if self.saturated.contains(&idx) {
                         stop_fwd = true;
-                        log::debug!("[find_work] Stop FWD at saturated idx={}", idx);
-                    } else if let Some(found) = check_candidate(idx) {
-                        return Some(found);
-                    } else if self.is_available(idx) {
+                    } else if let Some(res) = check_candidate(idx) {
+                        return Some(res);
+                    } else if self.is_available(idx, WorkType::Full) {
                         stop_fwd = true;
-                         log::debug!(
-                            "[find_work] Stop FWD at idx={} (dist={} over_budget={})", 
-                            idx, 
-                            if idx >= self.current_idx { idx - self.current_idx } else { self.current_idx - idx },
-                            over_budget
-                        );
                     }
                 }
                 fwd_dist += 1;
@@ -250,17 +263,10 @@ impl CacheState {
                     let idx = self.current_idx - bwd_dist;
                     if self.saturated.contains(&idx) {
                         stop_bwd = true;
-                        log::debug!("[find_work] Stop BWD at saturated idx={}", idx);
-                    } else if let Some(found) = check_candidate(idx) {
-                        return Some(found);
-                    } else if self.is_available(idx) {
+                    } else if let Some(res) = check_candidate(idx) {
+                        return Some(res);
+                    } else if self.is_available(idx, WorkType::Full) {
                         stop_bwd = true;
-                         log::debug!(
-                            "[find_work] Stop BWD at idx={} (dist={} over_budget={})", 
-                            idx, 
-                            if idx >= self.current_idx { idx - self.current_idx } else { self.current_idx - idx },
-                            over_budget
-                        );
                     }
                     bwd_dist += 1;
                 }
@@ -270,75 +276,90 @@ impl CacheState {
         None
     }
 
-    /// Insert a decoded image, then evict distant images if over budget.
-    /// If the new image would be the farthest and over budget, skip it
-    /// (it would be immediately evicted) and mark it saturated.
-    pub fn insert(&mut self, idx: usize, decoded: DecodedImage) {
-        if idx != self.current_idx && self.used_bytes + decoded.mem_size() > self.budget {
-            let my_dist = if idx >= self.current_idx {
-                idx - self.current_idx
-            } else {
-                self.current_idx - idx
-            };
-            let farthest_cached_dist = self.images.keys()
-                .filter(|&&i| i != self.current_idx)
-                .map(|&i| if i >= self.current_idx { i - self.current_idx } else { self.current_idx - i })
-                .max()
-                .unwrap_or(0);
-            
-            // If we are farther than the farthest thing we have, we can't fit.
-            if my_dist >= farthest_cached_dist {
-                log::debug!(
-                    "[saturated] idx={} dist={} (farthest_cached_dist={}) - skipping insert",
-                    idx, my_dist, farthest_cached_dist,
-                );
-                self.saturated.insert(idx);
-                return;
+    fn find_work_grid(&self) -> Option<(usize, WorkType)> {
+        // Grid mode: Fill thumbnails spiraling out from current_index.
+        // We want to prioritize the visible area which is centered on current_index.
+        // We check backward (upper half) first to encourage top-to-bottom filling.
+        
+        // Heuristic: Scan enough to cover a large screen of thumbnails + buffer.
+        // If specific GRID_COLS is 20, 600 covers 30 rows.
+        const SCAN_LIMIT: usize = 600;
+
+        for i in 0..SCAN_LIMIT {
+            // 1. Backward (current - i)
+            // We check this first to prioritize the "top" of the view (reading order)
+            if i > 0 {
+                if let Some(bwd) = self.current_idx.checked_sub(i) {
+                    if self.is_available(bwd, WorkType::Thumbnail) {
+                        return Some((bwd, WorkType::Thumbnail));
+                    }
+                }
+            }
+
+            // 2. Forward (current + i)
+            let fwd = self.current_idx + i;
+            if self.is_available(fwd, WorkType::Thumbnail) {
+                return Some((fwd, WorkType::Thumbnail));
             }
         }
-        // Handle re-insertion: subtract old bytes first
-        if let Some(old) = self.images.remove(&idx) {
-            self.used_bytes -= old.mem_size();
-        }
-        self.used_bytes += decoded.mem_size();
-        log::debug!(
-            "[insert] idx={} size={:.1}MB used={:.1}/{:.1}MB",
-            idx,
-            decoded.mem_size() as f64 / (1024.0 * 1024.0),
-            self.used_bytes as f64 / (1024.0 * 1024.0),
-            self.budget as f64 / (1024.0 * 1024.0)
-        );
-        self.images.insert(idx, Arc::new(decoded));
-        self.evict_distant();
+
+        None
     }
 
-    /// Remove images farthest from current_idx until under budget.
-    /// Never evicts the current_idx image.
+    /// Insert a decoded image. 
+    pub fn insert(&mut self, idx: usize, decoded: DecodedImage, wtype: WorkType) {
+        match wtype {
+            WorkType::Full => {
+                // Budget check only for full images for now
+                if idx != self.current_idx && self.used_bytes + decoded.mem_size() > self.budget {
+                    let my_dist = if idx >= self.current_idx { idx - self.current_idx } else { self.current_idx - idx };
+                    let farthest_dist = self.images.keys()
+                        .filter(|&&i| i != self.current_idx)
+                        .map(|&i| if i >= self.current_idx { i - self.current_idx } else { self.current_idx - i })
+                        .max()
+                        .unwrap_or(0);
+                    
+                    if my_dist >= farthest_dist {
+                        self.saturated.insert(idx);
+                        return;
+                    }
+                }
+                
+                if let Some(old) = self.images.remove(&idx) {
+                    self.used_bytes -= old.mem_size();
+                }
+                self.used_bytes += decoded.mem_size();
+                self.images.insert(idx, Arc::new(decoded));
+                self.evict_distant();
+            },
+            WorkType::Thumbnail => {
+                // Thumbnails are small and kept separate for now (ignoring budget, or managed separately?)
+                // A thumbnail is ~200x200x4 = 160KB. 1000 thumbnails = 160MB. 
+                // We should probably limit them too, but let's assume they fit for now.
+                self.thumbnails.insert(idx, Arc::new(decoded));
+                
+                // Optional: evict very far thumbnails if memory is tight?
+                // For now, let's keep them to ensure smooth scrolling.
+            }
+        }
+    }
+
     fn evict_distant(&mut self) {
         while self.used_bytes > self.budget && self.images.len() > 1 {
             let farthest = self.images.keys()
                 .filter(|&&idx| idx != self.current_idx)
                 .max_by_key(|&&idx| {
-                    if idx >= self.current_idx {
-                        idx - self.current_idx
-                    } else {
-                        self.current_idx - idx
-                    }
+                    if idx >= self.current_idx { idx - self.current_idx } else { self.current_idx - idx }
                 })
                 .copied();
+            
             match farthest {
                 Some(evict_idx) => {
                     if let Some(img) = self.images.remove(&evict_idx) {
-                        log::debug!(
-                            "[evict] idx={} dist={} freed={:.1}MB",
-                            evict_idx,
-                            if evict_idx >= self.current_idx { evict_idx - self.current_idx } else { self.current_idx - evict_idx },
-                            img.mem_size() as f64 / (1024.0 * 1024.0),
-                        );
                         self.used_bytes -= img.mem_size();
                     }
                 }
-                None => break, // only current_idx remains
+                None => break,
             }
         }
     }
@@ -351,6 +372,7 @@ impl CacheState {
 #[derive(Debug)]
 pub enum UserEvent {
     ImageReady(usize),
+    ThumbnailReady(usize),
     FileListUpdated,
 }
 
@@ -371,21 +393,18 @@ pub fn spawn_decode_workers(
         thread::spawn(move || {
             loop {
                 // Wait for work
-                let idx = {
+                let (idx, wtype) = {
                     let (lock, cvar) = &*shared;
                     let mut state = lock.lock().unwrap();
                     loop {
-                        if let Some(idx) = state.find_work() {
-                            state.in_progress.insert(idx);
-                            log::debug!("[schedule] Worker picked up idx={}", idx);
-                            break idx;
+                        if let Some((idx, wtype)) = state.find_work() {
+                            state.in_progress.insert((idx, wtype));
+                            break (idx, wtype);
                         }
                         state = cvar.wait(state).unwrap();
                     }
                 };
 
-                // Decode (no lock held — this is the slow part)
-                // We must hold read lock on files just long enough to get the path
                 let path_opt = {
                     let guard = files.read().unwrap();
                     if idx < guard.len() {
@@ -396,53 +415,45 @@ pub fn spawn_decode_workers(
                 };
 
                 if let Some(path) = path_opt {
-                    let t0 = Instant::now();
-                    let result = decode_image(&path);
-                    let elapsed = t0.elapsed();
+                    // Decide size
+                    let target_size = match wtype {
+                        WorkType::Full => None,
+                        WorkType::Thumbnail => Some((200, 200)), // Fixed thumbnail size
+                    };
 
-                    // Insert result and wake other workers
+                    let result = decode_image(&path, target_size);
+
                     {
                         let (lock, cvar) = &*shared;
                         let mut state = lock.lock().unwrap();
-                        state.in_progress.remove(&idx);
+                        state.in_progress.remove(&(idx, wtype));
+                        
                         match result {
                             Ok(decoded) => {
-                                let bytes = decoded.rgba_bytes.len() as f64;
-                                let secs = elapsed.as_secs_f64();
-                                let mbps = if secs > 0.0 { bytes / secs / (1024.0 * 1024.0) } else { 0.0 };
-                                log::debug!(
-                                    "[decode] idx={} file={} {:.1}ms {:.1} MB/s",
-                                    idx,
-                                    path.file_name().unwrap_or_default().to_string_lossy(),
-                                    secs * 1000.0,
-                                    mbps,
-                                );
-                                state.insert(idx, decoded);
+                                state.insert(idx, decoded, wtype);
                             }
                             Err(e) => {
-                                log::warn!(
-                                    "[decode] idx={} file={} FAILED: {}",
-                                    idx,
-                                    path.file_name().unwrap_or_default().to_string_lossy(),
-                                    e,
-                                );
-                                state.errors.insert(
-                                    idx,
-                                    format!("{}: {}", path.display(), e),
-                                );
+                                match wtype {
+                                    WorkType::Full => {
+                                        state.errors.insert(idx, format!("{}: {}", path.display(), e));
+                                    }
+                                    WorkType::Thumbnail => {
+                                        state.thumbnail_errors.insert(idx);
+                                    }
+                                }
                             }
                         }
                         cvar.notify_all();
                     }
 
-                    // Wake the UI
-                    let _ = proxy.send_event(UserEvent::ImageReady(idx));
+                    match wtype {
+                        WorkType::Full => { let _ = proxy.send_event(UserEvent::ImageReady(idx)); },
+                        WorkType::Thumbnail => { let _ = proxy.send_event(UserEvent::ThumbnailReady(idx)); },
+                    }
                 } else {
-                    // Invalid index? Should not happen if CacheState is synced.
-                    // Just clear it from in_progress
                     let (lock, _) = &*shared;
                     let mut state = lock.lock().unwrap();
-                    state.in_progress.remove(&idx);
+                    state.in_progress.remove(&(idx, wtype));
                 }
             }
         });

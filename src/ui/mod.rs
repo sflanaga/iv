@@ -98,6 +98,12 @@ impl ApplicationHandler<UserEvent> for App {
                     window.request_redraw();
                 }
             }
+            UserEvent::ThumbnailReady(_) => {
+                // Request redraw to show the new thumbnail
+                if let Some(ref window) = self.window {
+                    window.request_redraw();
+                }
+            }
         }
     }
 
