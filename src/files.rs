@@ -24,6 +24,7 @@ pub fn spawn_file_scanner(
     paths: Vec<PathBuf>,
     file_list: Option<PathBuf>,
     recursive: bool,
+    follow_links: bool,
     files_arc: Arc<RwLock<Vec<PathBuf>>>,
     proxy: EventLoopProxy<UserEvent>,
 ) {
@@ -31,6 +32,17 @@ pub fn spawn_file_scanner(
         log::info!("Starting background image scan...");
         let start_time = Instant::now();
         let mut count = 0;
+
+        let should_process = |p: &PathBuf| -> bool {
+            if !follow_links {
+                if let Ok(meta) = fs::symlink_metadata(p) {
+                    if meta.file_type().is_symlink() {
+                        return false;
+                    }
+                }
+            }
+            true
+        };
 
         // 1. Read from file list if provided
         if let Some(list_path) = file_list {
@@ -46,6 +58,8 @@ pub fn spawn_file_scanner(
                                 if trimmed.is_empty() { continue; }
                                 
                                 let p = PathBuf::from(trimmed);
+                                if !should_process(&p) { continue; }
+
                                 if p.is_file() {
                                     if is_image_file(&p) {
                                         {
@@ -63,6 +77,8 @@ pub fn spawn_file_scanner(
                                     // Try split whitespace
                                     for sub in trimmed.split_whitespace() {
                                         let sub_p = PathBuf::from(sub);
+                                        if !should_process(&sub_p) { continue; }
+
                                         if sub_p.is_file() && is_image_file(&sub_p) {
                                             {
                                                 let mut guard = files_arc.write().unwrap();
@@ -84,8 +100,10 @@ pub fn spawn_file_scanner(
 
         // 2. Scan explicit paths
         for path in paths {
+            if !should_process(&path) { continue; }
+
             if path.is_dir() {
-                scan_dir(&path, recursive, &files_arc, &proxy, &mut count);
+                scan_dir(&path, recursive, follow_links, &files_arc, &proxy, &mut count);
             } else if path.is_file() && is_image_file(&path) {
                 {
                     let mut guard = files_arc.write().unwrap();
@@ -112,6 +130,7 @@ pub fn spawn_file_scanner(
 fn scan_dir(
     dir: &Path, 
     recursive: bool, 
+    follow_links: bool,
     files_arc: &Arc<RwLock<Vec<PathBuf>>>, 
     proxy: &EventLoopProxy<UserEvent>,
     count: &mut usize
@@ -121,6 +140,16 @@ fn scan_dir(
     let mut subdirs = Vec::new();
     
     for entry in entries.filter_map(|e| e.ok()) {
+        let ft = if let Ok(ft) = entry.file_type() {
+            ft
+        } else {
+            continue;
+        };
+
+        if ft.is_symlink() && !follow_links {
+            continue;
+        }
+
         let p = entry.path();
         if p.is_file() && is_image_file(&p) {
             files.push(p);
@@ -146,7 +175,7 @@ fn scan_dir(
     if recursive {
         subdirs.sort();
         for sub in subdirs {
-            scan_dir(&sub, true, files_arc, proxy, count);
+            scan_dir(&sub, true, follow_links, files_arc, proxy, count);
         }
     }
 }

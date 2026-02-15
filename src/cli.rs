@@ -42,6 +42,10 @@ pub struct Cli {
     #[arg(short, long)]
     pub recursive: bool,
 
+    /// Follow symbolic links (default: false)
+    #[arg(long)]
+    pub follow_links: bool,
+
     /// Initial delay in ms before key-hold repeat begins (default: 500)
     #[arg(long, default_value = "500")]
     pub initial_delay: u64,

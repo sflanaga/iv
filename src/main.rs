@@ -48,6 +48,7 @@ fn main() {
         cli.paths.clone(),
         cli.file_list.clone(),
         cli.recursive,
+        cli.follow_links,
         Arc::clone(&files),
         proxy.clone(),
     );

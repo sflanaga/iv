@@ -157,6 +157,18 @@ impl ViewerState {
             let (lock, cvar) = &*self.shared;
             let mut state = lock.lock().unwrap();
             state.set_mode(self.view_mode);
+            
+            // If switching to Single mode, update current_decoded immediately
+            if self.view_mode == ViewMode::Single {
+                if let Some(img) = state.get(self.current_index) {
+                    self.current_decoded = Some(img);
+                    self.displayed_index = self.current_index;
+                } else {
+                    // Clear old image so we don't show a stale one while loading
+                    self.current_decoded = None;
+                }
+            }
+
             cvar.notify_all();
 
             // Reset view params
