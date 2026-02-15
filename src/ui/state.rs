@@ -601,6 +601,53 @@ impl ViewerState {
                  fill_rect(frame, fb_w, fb_h, x + thumb_w as i32 - 2, y, 2, thumb_h as u32, border_color); // Right
             }
         }
+
+        // Progress Overlay
+        {
+            let count = state.thumbnails.len();
+            let total = state.file_count;
+            let current = self.current_index + 1;
+            let msg = format!("Thumbnails: {} / {} | Selected: {}", count, total, current);
+            
+            // Draw background (approx 450x30)
+            fill_rect(frame, fb_w, fb_h, 0, 0, 450, 30, (0, 0, 0, 200));
+            // Draw text
+            draw_text(frame, fb_w, fb_h, &msg, 10, 8, 2, (255, 255, 255, 255));
+        }
+
+        // Info Overlay (if 'i' is pressed)
+        if self.show_info {
+            let files_guard = self.files.read().unwrap();
+            let filename = if self.current_index < files_guard.len() {
+                files_guard[self.current_index].display().to_string()
+            } else {
+                "Loading...".to_string()
+            };
+            drop(files_guard);
+
+            let (w, h, fmt, size) = if let Some(dec) = state.get_thumbnail(self.current_index) {
+                (dec.width, dec.height, dec.format_name.clone(), dec.file_size)
+            } else {
+                (0, 0, "???".to_string(), 0)
+            };
+
+            let line1 = format!("[{}/{}]", self.current_index + 1, state.file_count);
+            let line2 = filename;
+            let line3 = format!("Thumb: {}x{} | {} | {:.1} KB", w, h, fmt, size as f64 / 1024.0);
+            
+            let text_scale: u32 = 2;
+            let line_h = (7 * text_scale + 4) as i32;
+            let bar_h = (line_h * 3 + 8) as u32; 
+            
+            // Draw below the progress bar
+            let start_y = 35;
+            fill_rect(frame, fb_w, fb_h, 0, start_y, fb_w, bar_h, (0, 0, 0, 178));
+            
+            let white = (255, 255, 255, 255);
+            draw_text(frame, fb_w, fb_h, &line1, 10, start_y + 4, text_scale, white);
+            draw_text(frame, fb_w, fb_h, &line2, 10, start_y + 4 + line_h, text_scale, white);
+            draw_text(frame, fb_w, fb_h, &line3, 10, start_y + 4 + line_h * 2, text_scale, white);
+        }
     }
 
     fn render_single(&self, frame: &mut [u32], fb_w: u32, fb_h: u32) {

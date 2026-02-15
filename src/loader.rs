@@ -281,11 +281,12 @@ impl CacheState {
         // We want to prioritize the visible area which is centered on current_index.
         // We check backward (upper half) first to encourage top-to-bottom filling.
         
-        // Heuristic: Scan enough to cover a large screen of thumbnails + buffer.
-        // If specific GRID_COLS is 20, 600 covers 30 rows.
-        const SCAN_LIMIT: usize = 600;
+        // Scan ALL files.
+        // We use the file_count as the limit to ensure we cover the entire list
+        // regardless of where current_idx is.
+        let limit = self.file_count;
 
-        for i in 0..SCAN_LIMIT {
+        for i in 0..limit {
             // 1. Backward (current - i)
             // We check this first to prioritize the "top" of the view (reading order)
             if i > 0 {
@@ -298,8 +299,13 @@ impl CacheState {
 
             // 2. Forward (current + i)
             let fwd = self.current_idx + i;
-            if self.is_available(fwd, WorkType::Thumbnail) {
-                return Some((fwd, WorkType::Thumbnail));
+            // Only check if within bounds. 
+            // If fwd is out of bounds, we still continue the loop because 'bwd' might still be valid
+            // (e.g. if we are at the end of the list, we need to scan backwards to 0).
+            if fwd < self.file_count {
+                if self.is_available(fwd, WorkType::Thumbnail) {
+                    return Some((fwd, WorkType::Thumbnail));
+                }
             }
         }
 
