@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -8,6 +8,7 @@ use winit::window::{Fullscreen, Window};
 use winit::keyboard::NamedKey;
 
 use crate::cli::HELP_KEYS;
+use crate::dedupe::DuplicateInfo;
 use crate::loader::{DecodedImage, SharedState, ViewMode};
 use crate::ui::render::{
     blit_scaled_rotated, draw_text, fill_rect, fit_scale, rgb, BG_COLOR,
@@ -27,6 +28,7 @@ const GRID_COLS: usize = 20;
 pub struct ViewerState {
     pub files: Arc<RwLock<Vec<PathBuf>>>,
     pub shared: SharedState,
+    pub duplicate_info: Option<Arc<RwLock<HashMap<PathBuf, DuplicateInfo>>>>,
     pub current_index: usize,
     /// The index of the image currently stored in `current_decoded`.
     /// May differ from `current_index` if we are waiting for a load.
@@ -77,10 +79,12 @@ impl ViewerState {
         initial_delay: f64,
         repeat_delay: f64,
         marked_file_output: Option<PathBuf>,
+        duplicate_info: Option<Arc<RwLock<HashMap<PathBuf, DuplicateInfo>>>>,
     ) -> Self {
         Self {
             files,
             shared,
+            duplicate_info,
             current_index: 0,
             displayed_index: 0,
             current_decoded: None,
@@ -495,9 +499,42 @@ impl ViewerState {
     }
 
     fn mark_current_file(&self) {
-        let files_guard = self.files.read().unwrap();
-        if self.current_index < files_guard.len() {
-            let path = &files_guard[self.current_index];
+        let current_path = {
+            let files_guard = self.files.read().unwrap();
+            if self.current_index >= files_guard.len() {
+                return;
+            }
+            files_guard[self.current_index].clone()
+        };
+
+        let mut paths_to_mark = Vec::new();
+        let mut cluster_found = false;
+
+        if let Some(ref dupe_map) = self.duplicate_info {
+             if let Ok(map) = dupe_map.read() {
+                 if let Some(info) = map.get(&current_path) {
+                     cluster_found = true;
+                     let target = &info.original_path;
+                     // Find all in cluster
+                     for (p, entry) in map.iter() {
+                         if &entry.original_path == target {
+                             paths_to_mark.push(p.clone());
+                         }
+                     }
+                 }
+             }
+        }
+
+        if !cluster_found {
+            paths_to_mark.push(current_path);
+        }
+
+        // Sort for consistent output if we found a cluster
+        if cluster_found {
+            paths_to_mark.sort();
+        }
+
+        for path in paths_to_mark {
             if let Some(ref out_path) = self.marked_file_output {
                 // Append to file
                 match fs::OpenOptions::new().create(true).append(true).open(out_path) {
@@ -630,11 +667,12 @@ impl ViewerState {
         // Info Overlay (if 'i' is pressed)
         if self.show_info {
             let files_guard = self.files.read().unwrap();
-            let filename = if self.current_index < files_guard.len() {
-                files_guard[self.current_index].display().to_string()
+            let path_opt = if self.current_index < files_guard.len() {
+                Some(files_guard[self.current_index].clone())
             } else {
-                "Loading...".to_string()
+                None
             };
+            let filename = path_opt.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "Loading...".to_string());
             drop(files_guard);
 
             let (w, h, fmt, size) = if let Some(dec) = state.get_thumbnail(self.current_index) {
@@ -647,18 +685,41 @@ impl ViewerState {
             let line2 = filename;
             let line3 = format!("Thumb: {}x{} | {} | {:.1} KB", w, h, fmt, size as f64 / 1024.0);
             
+            let mut lines = vec![line1, line2, line3];
+            let mut dupe_color = None;
+
+            if let Some(ref dupe_map) = self.duplicate_info {
+                if let Some(path) = path_opt {
+                    if let Ok(map) = dupe_map.read() {
+                        if let Some(info) = map.get(&path) {
+                            if info.is_original {
+                                let count = map.values().filter(|v| v.original_path == info.original_path && !v.is_original).count();
+                                lines.push(format!("-- ORIGINAL IMAGE -- ({} copies found)", count));
+                                dupe_color = Some((100, 255, 100, 255)); // Greenish
+                            } else {
+                                lines.push(format!("DUPLICATE of: {}", info.original_path.file_name().unwrap_or_default().to_string_lossy()));
+                                lines.push(format!("Distance: {}", info.distance));
+                                dupe_color = Some((255, 100, 100, 255)); // Reddish
+                            }
+                        }
+                    }
+                }
+            }
+
             let text_scale: u32 = 2;
             let line_h = (7 * text_scale + 4) as i32;
-            let bar_h = (line_h * 3 + 8) as u32; 
+            let bar_h = (line_h * lines.len() as i32 + 8) as u32; 
             
             // Draw below the progress bar
             let start_y = 35;
             fill_rect(frame, fb_w, fb_h, 0, start_y, fb_w, bar_h, (0, 0, 0, 178));
             
             let white = (255, 255, 255, 255);
-            draw_text(frame, fb_w, fb_h, &line1, 10, start_y + 4, text_scale, white);
-            draw_text(frame, fb_w, fb_h, &line2, 10, start_y + 4 + line_h, text_scale, white);
-            draw_text(frame, fb_w, fb_h, &line3, 10, start_y + 4 + line_h * 2, text_scale, white);
+            
+            for (i, line) in lines.iter().enumerate() {
+                let color = if i >= 3 && dupe_color.is_some() { dupe_color.unwrap() } else { white };
+                draw_text(frame, fb_w, fb_h, line, 10, start_y + 4 + line_h * i as i32, text_scale, color);
+            }
         }
     }
 
@@ -743,15 +804,40 @@ impl ViewerState {
                         cached, files_len, used_mb, budget_mb,
                     )
                 };
+
+                let mut lines = vec![line1, line2, line3, line4];
+                let mut dupe_color = None;
+
+                if let Some(ref dupe_map) = self.duplicate_info {
+                     let files_guard = self.files.read().unwrap();
+                     if self.current_index < files_guard.len() {
+                         let path = &files_guard[self.current_index];
+                         if let Ok(map) = dupe_map.read() {
+                             if let Some(info) = map.get(path) {
+                                 if info.is_original {
+                                     let count = map.values().filter(|v| v.original_path == info.original_path && !v.is_original).count();
+                                     lines.push(format!("-- ORIGINAL IMAGE -- ({} copies found)", count));
+                                     dupe_color = Some((100, 255, 100, 255)); // Greenish
+                                 } else {
+                                     lines.push(format!("DUPLICATE of: {}", info.original_path.file_name().unwrap_or_default().to_string_lossy()));
+                                     lines.push(format!("Distance: {}", info.distance));
+                                     dupe_color = Some((255, 100, 100, 255)); // Reddish
+                                 }
+                             }
+                         }
+                     }
+                }
+
                 let text_scale: u32 = 2;
                 let line_h = (7 * text_scale + 4) as i32;
-                let bar_h = (line_h * 4 + 8) as u32;
+                let bar_h = (line_h * lines.len() as i32 + 8) as u32;
                 fill_rect(frame, fb_w, fb_h, 0, 0, fb_w, bar_h, (0, 0, 0, 178));
                 let white = (255, 255, 255, 255);
-                draw_text(frame, fb_w, fb_h, &line1, 10, 4, text_scale, white);
-                draw_text(frame, fb_w, fb_h, &line2, 10, 4 + line_h, text_scale, white);
-                draw_text(frame, fb_w, fb_h, &line3, 10, 4 + line_h * 2, text_scale, white);
-                draw_text(frame, fb_w, fb_h, &line4, 10, 4 + line_h * 3, text_scale, white);
+                
+                for (i, line) in lines.iter().enumerate() {
+                    let color = if i >= 4 && dupe_color.is_some() { dupe_color.unwrap() } else { white };
+                    draw_text(frame, fb_w, fb_h, line, 10, 4 + line_h * i as i32, text_scale, color);
+                }
             }
         }
 

@@ -1,15 +1,16 @@
 mod cli;
-mod dedupe;
+pub mod dedupe;
 mod files;
 mod loader;
 mod ui;
 
 use clap::Parser;
+use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use winit::event_loop::EventLoop;
 
 use crate::cli::{parse_memory_budget, default_memory_budget, Cli};
-use crate::dedupe::spawn_dedupe_scanner;
+use crate::dedupe::{spawn_dedupe_scanner, DuplicateInfo};
 use crate::files::spawn_file_scanner;
 use crate::loader::{spawn_decode_workers, CacheState, SharedState, UserEvent};
 use crate::ui::state::ViewerState;
@@ -30,6 +31,9 @@ fn main() {
 
     // Shared file list, initially empty. Populated by background scanner.
     let files = Arc::new(RwLock::new(Vec::new()));
+    
+    // Shared duplicate info map
+    let dupe_info = Arc::new(RwLock::new(HashMap::<std::path::PathBuf, DuplicateInfo>::new()));
     
     // Initial file count is 0. Will be updated via UserEvent::FileListUpdated.
     let shared: SharedState = Arc::new((
@@ -53,6 +57,7 @@ fn main() {
             cli.follow_links,
             cli.threshold,
             Arc::clone(&files),
+            Arc::clone(&dupe_info),
             proxy.clone(),
         );
     } else {
@@ -77,7 +82,8 @@ fn main() {
         Arc::clone(&shared), 
         initial_delay, 
         repeat_delay, 
-        cli.marked_file_output
+        cli.marked_file_output,
+        if cli.find_duplicates { Some(dupe_info) } else { None },
     );
 
     if cli.find_duplicates {
