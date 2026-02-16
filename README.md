@@ -67,6 +67,16 @@ find . -name "*.jpg" > list.txt
 iv -L list.txt
 ```
 
+**Find Duplicates:**
+Scan a directory for duplicate or similar images.
+```bash
+# Find exact or near-exact duplicates (default threshold: 2)
+iv -D --recursive ~/Pictures
+
+# Find similar images (looser threshold, e.g. resized or slightly edited)
+iv -D --threshold 10 ~/Pictures
+```
+
 ### Key Bindings
 
 | Key | Action |
@@ -102,4 +112,5 @@ You can enable logging to diagnose issues or watch the preloader in action:
 
 ```bash
 RUST_LOG=debug iv .
+```
 ```

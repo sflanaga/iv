@@ -1,4 +1,5 @@
 mod cli;
+mod dedupe;
 mod files;
 mod loader;
 mod ui;
@@ -8,6 +9,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use winit::event_loop::EventLoop;
 
 use crate::cli::{parse_memory_budget, default_memory_budget, Cli};
+use crate::dedupe::spawn_dedupe_scanner;
 use crate::files::spawn_file_scanner;
 use crate::loader::{spawn_decode_workers, CacheState, SharedState, UserEvent};
 use crate::ui::state::ViewerState;
@@ -44,14 +46,25 @@ fn main() {
     let proxy = event_loop.create_proxy();
 
     // Spawn file scanner (producer)
-    spawn_file_scanner(
-        cli.paths.clone(),
-        cli.file_list.clone(),
-        cli.recursive,
-        cli.follow_links,
-        Arc::clone(&files),
-        proxy.clone(),
-    );
+    if cli.find_duplicates {
+        spawn_dedupe_scanner(
+            cli.paths.clone(),
+            cli.recursive,
+            cli.follow_links,
+            cli.threshold,
+            Arc::clone(&files),
+            proxy.clone(),
+        );
+    } else {
+        spawn_file_scanner(
+            cli.paths.clone(),
+            cli.file_list.clone(),
+            cli.recursive,
+            cli.follow_links,
+            Arc::clone(&files),
+            proxy.clone(),
+        );
+    }
 
     // Spawn decode workers (consumers)
     spawn_decode_workers(Arc::clone(&shared), Arc::clone(&files), proxy, num_threads);
@@ -59,13 +72,20 @@ fn main() {
     let initial_delay = cli.initial_delay as f64 / 1000.0;
     let repeat_delay = cli.repeat_delay as f64 / 1000.0;
 
-    let state = ViewerState::new(
+    let mut state = ViewerState::new(
         files, 
-        shared, 
+        Arc::clone(&shared), 
         initial_delay, 
         repeat_delay, 
         cli.marked_file_output
     );
+
+    if cli.find_duplicates {
+        state.view_mode = crate::loader::ViewMode::Grid;
+        // Update shared state mode as well so loader prioritizes thumbnails
+        let (lock, _) = &*shared;
+        lock.lock().unwrap().mode = crate::loader::ViewMode::Grid;
+    }
 
     let mut app = App::new(state);
 

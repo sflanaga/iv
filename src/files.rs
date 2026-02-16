@@ -13,7 +13,7 @@ const IMAGE_EXTENSIONS: &[&str] = &[
     "pgm", "ppm", "pam", "dds", "hdr", "exr", "ff", "qoi",
 ];
 
-fn is_image_file(path: &Path) -> bool {
+pub fn is_image_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| IMAGE_EXTENSIONS.contains(&e.to_lowercase().as_str()))
