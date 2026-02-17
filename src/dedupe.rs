@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Instant;
@@ -168,6 +169,162 @@ pub fn spawn_dedupe_scanner(
             seen.len()
         );
     });
+}
+
+#[derive(Debug)]
+struct ScannedImage {
+    path: PathBuf,
+    hash: ImageHash,
+    width: u32,
+    height: u32,
+}
+
+pub fn run_headless_dedupe(
+    paths: Vec<PathBuf>,
+    recursive: bool,
+    follow_links: bool,
+    threshold: u32,
+    output_path: PathBuf,
+) {
+    let mut all_files = Vec::new();
+    for path in &paths {
+        if path.is_dir() {
+            collect_files(path, recursive, follow_links, &mut all_files);
+        } else if path.is_file() {
+            if is_image_file(path) {
+                all_files.push(path.clone());
+            }
+        }
+    }
+    
+    // Sort for deterministic behavior
+    all_files.sort();
+
+    let total_files = all_files.len();
+    eprintln!("Found {} candidates. Hashing...", total_files);
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    
+    // Spawn ticker thread
+    let ticker_counter = Arc::clone(&counter);
+    let ticker_stop = Arc::clone(&stop_signal);
+    
+    let ticker_handle = thread::spawn(move || {
+        while !ticker_stop.load(Ordering::Relaxed) {
+            let current = ticker_counter.load(Ordering::Relaxed);
+            eprint!("\rScanning: {} / {}", current, total_files);
+            // Flush stderr to ensure line updates
+            use std::io::Write;
+            let _ = std::io::stderr().flush();
+            thread::sleep(std::time::Duration::from_secs(1));
+        }
+        // One final print to clear/finalize line
+        eprintln!("\rScanning: {} / {} - Done.", ticker_counter.load(Ordering::Relaxed), total_files);
+    });
+
+    let hasher_config = HasherConfig::new();
+    let scanned: Vec<ScannedImage> = all_files.par_iter()
+        .filter_map(|path| {
+            let res = {
+                let hasher = hasher_config.to_hasher();
+                 match ImageReader::open(path) {
+                    Ok(reader) => match reader.decode() {
+                        Ok(img) => {
+                            let hash = hasher.hash_image(&img);
+                            Some(ScannedImage {
+                                path: path.clone(),
+                                hash,
+                                width: img.width(),
+                                height: img.height(),
+                            })
+                        },
+                        Err(_) => None, 
+                    },
+                    Err(_) => None,
+                }
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+            res
+        })
+        .collect();
+    
+    // Stop ticker
+    stop_signal.store(true, Ordering::Relaxed);
+    let _ = ticker_handle.join();
+        
+    eprintln!("Hashed {} images. Clustering...", scanned.len());
+
+    // Clustering
+    let mut clusters: Vec<Vec<ScannedImage>> = Vec::new();
+    
+    for img in scanned {
+        let mut match_index = None;
+        for (i, cluster) in clusters.iter().enumerate() {
+            // Compare with the first one (representative)
+            if img.hash.dist(&cluster[0].hash) <= threshold {
+                match_index = Some(i);
+                break;
+            }
+        }
+        
+        if let Some(i) = match_index {
+            clusters[i].push(img);
+        } else {
+            clusters.push(vec![img]);
+        }
+    }
+    
+    eprintln!("Found {} clusters. Writing output to {}...", clusters.len(), output_path.display());
+
+    // Post-process and write to file
+    use std::io::Write;
+    let mut file = match fs::File::create(&output_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error creating output file: {}", e);
+            return;
+        }
+    };
+
+    // Header
+    let now = chrono::Local::now();
+    writeln!(file, "Duplicate Scan Report").unwrap();
+    writeln!(file, "Time: {}", now.format("%Y-%m-%d %H:%M:%S")).unwrap();
+    writeln!(file, "Scanned Directories:").unwrap();
+    for p in &paths {
+        writeln!(file, "  - {}", p.display()).unwrap();
+    }
+    writeln!(file, "Total Files Scanned: {}", total_files).unwrap();
+    writeln!(file, "Threshold: {}", threshold).unwrap();
+    writeln!(file, "--------------------------------------------------").unwrap();
+
+    for mut cluster in clusters {
+        // Only interested in duplicates (cluster size > 1)
+        if cluster.len() > 1 {
+            // Find best original: max pixels, then alphabetical path
+            // We want to sort such that index 0 is the best.
+            cluster.sort_by(|a, b| {
+                let pixels_a = a.width as u64 * a.height as u64;
+                let pixels_b = b.width as u64 * b.height as u64;
+                
+                if pixels_a != pixels_b {
+                    return pixels_b.cmp(&pixels_a); // Descending resolution
+                }
+                a.path.cmp(&b.path) // Ascending path for deterministic tie-break
+            });
+            
+            let original = &cluster[0];
+            writeln!(file, "# {}", original.path.display()).unwrap();
+            
+            for i in 1..cluster.len() {
+                let dup = &cluster[i];
+                let dist = dup.hash.dist(&original.hash);
+                writeln!(file, "D {} {}", dist, dup.path.display()).unwrap();
+            }
+        }
+    }
+    eprintln!("Done.");
 }
 
 fn collect_files(

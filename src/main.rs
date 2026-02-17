@@ -24,6 +24,26 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
 
+    if let Some(dump_path) = cli.dump {
+        if !cli.find_duplicates {
+            eprintln!("Error: --dump requires -D / --find-duplicates");
+            std::process::exit(1);
+        }
+
+        if dump_path.exists() {
+            eprintln!("Warning: Output file '{}' already exists. It will be overwritten.", dump_path.display());
+        }
+
+        crate::dedupe::run_headless_dedupe(
+            cli.paths,
+            cli.recursive,
+            cli.follow_links,
+            cli.threshold,
+            dump_path,
+        );
+        return;
+    }
+
     let budget = match &cli.memory {
         Some(s) => parse_memory_budget(s),
         None => default_memory_budget(),

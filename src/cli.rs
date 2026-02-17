@@ -54,6 +54,10 @@ pub struct Cli {
     #[arg(long, default_value = "2")]
     pub threshold: u32,
 
+    /// Dump duplicates to the specified file and exit (requires -D)
+    #[arg(long, value_name = "FILE")]
+    pub dump: Option<std::path::PathBuf>,
+
     /// Initial delay in ms before key-hold repeat begins (default: 500)
     #[arg(long, default_value = "500")]
     pub initial_delay: u64,
