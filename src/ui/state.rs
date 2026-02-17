@@ -940,10 +940,11 @@ impl ViewerState {
         if self.show_help {
             fill_rect(frame, fb_w, fb_h, 0, 0, fb_w, fb_h, (0, 0, 0, 200));
             let text_scale = self.font_size;
+            let line_h = (7 * text_scale + 4) as i32;
             let mut y = 20;
             for line in HELP_KEYS.lines() {
                 draw_text(frame, fb_w, fb_h, line, 20, y, text_scale, (255, 255, 255, 255));
-                y += 24;
+                y += line_h;
             }
         }
     }
