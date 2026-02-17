@@ -70,6 +70,7 @@ pub struct ViewerState {
     pub marked_file_output: Option<PathBuf>,
     pub show_help: bool,
     pub rotation: u8, // 0=0, 1=90, 2=180, 3=270 (CW)
+    pub font_size: u32,
 }
 
 impl ViewerState {
@@ -80,6 +81,7 @@ impl ViewerState {
         repeat_delay: f64,
         marked_file_output: Option<PathBuf>,
         duplicate_info: Option<Arc<RwLock<HashMap<PathBuf, DuplicateInfo>>>>,
+        font_size: u32,
     ) -> Self {
         Self {
             files,
@@ -112,6 +114,7 @@ impl ViewerState {
             marked_file_output,
             show_help: false,
             rotation: 0,
+            font_size,
         }
     }
 
@@ -462,6 +465,18 @@ impl ViewerState {
         }
 
         // ------------------------------------------------------------------
+        // Font size cycle
+        // ------------------------------------------------------------------
+        if self.is_char_pressed('s') {
+            self.font_size = match self.font_size {
+                1 => 2,
+                2 => 3,
+                3 => 4,
+                _ => 1,
+            };
+        }
+
+        // ------------------------------------------------------------------
         // Zoom: z = 1:1 toggle (was 'z')
         // ------------------------------------------------------------------
         
@@ -701,7 +716,7 @@ impl ViewerState {
             // Draw background (approx 450x30)
             fill_rect(frame, fb_w, fb_h, 0, 0, 450, 30, (0, 0, 0, 200));
             // Draw text
-            draw_text(frame, fb_w, fb_h, &msg, 10, 8, 2, (255, 255, 255, 255));
+            draw_text(frame, fb_w, fb_h, &msg, 10, 8, self.font_size, (255, 255, 255, 255));
         }
 
         // Info Overlay (if 'i' is pressed)
@@ -754,7 +769,7 @@ impl ViewerState {
                 }
             }
 
-            let text_scale: u32 = 2;
+            let text_scale = self.font_size;
             let line_h = (7 * text_scale + 4) as i32;
             let bar_h = (line_h * lines.len() as i32 + 8) as u32; 
             
@@ -893,7 +908,7 @@ impl ViewerState {
                     }
                 }
 
-                let text_scale: u32 = 2;
+                let text_scale = self.font_size;
                 let line_h = (7 * text_scale + 4) as i32;
                 let bar_h = (line_h * lines.len() as i32 + 8) as u32;
                 fill_rect(frame, fb_w, fb_h, 0, 0, fb_w, bar_h, (0, 0, 0, 178));
@@ -908,11 +923,11 @@ impl ViewerState {
 
         // Check for Error or Loading state overlays
         if let Some(ref err) = self.error_message {
-            let text_scale: u32 = 2;
+            let text_scale = self.font_size;
             draw_text(frame, fb_w, fb_h, err, 20, fb_h as i32 / 2, text_scale, (255, 80, 80, 255));
         } else if self.displayed_index != self.current_index || self.current_decoded.is_none() {
              // ... existing loading log ...
-            let text_scale: u32 = 2;
+            let text_scale = self.font_size;
             let tx = (fb_w as i32) / 2 - 30;
             // Draw a semi-transparent box behind "Loading..." if we have an image under it
             if self.current_decoded.is_some() {
@@ -924,7 +939,7 @@ impl ViewerState {
         // Help Overlay
         if self.show_help {
             fill_rect(frame, fb_w, fb_h, 0, 0, fb_w, fb_h, (0, 0, 0, 200));
-            let text_scale = 2;
+            let text_scale = self.font_size;
             let mut y = 20;
             for line in HELP_KEYS.lines() {
                 draw_text(frame, fb_w, fb_h, line, 20, y, text_scale, (255, 255, 255, 255));

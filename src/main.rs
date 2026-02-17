@@ -104,6 +104,7 @@ fn main() {
         repeat_delay, 
         cli.marked_file_output,
         if cli.find_duplicates { Some(dupe_info) } else { None },
+        cli.font_size,
     );
 
     if cli.find_duplicates {

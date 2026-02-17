@@ -8,6 +8,7 @@ Key Bindings:
   Right / l     : Next image
   Space         : Next image
   f             : Toggle fullscreen
+  s             : Cycle font size
   t             : Toggle thumbnail view
   i             : Toggle info overlay
   M             : Dump metadata to stdout
@@ -66,6 +67,10 @@ pub struct Cli {
     /// Key-hold repeat interval in milliseconds for navigation (default: 35)
     #[arg(long, default_value = "35")]
     pub repeat_delay: u64,
+
+    /// Initial font size scaling factor (default: 2)
+    #[arg(long, default_value = "2")]
+    pub font_size: u32,
 }
 
 pub fn parse_memory_budget(s: &str) -> u64 {
