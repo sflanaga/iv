@@ -377,6 +377,46 @@ impl ViewerState {
         }
 
         // ------------------------------------------------------------------
+        // Dump Metadata (M)
+        // ------------------------------------------------------------------
+        if self.is_char_pressed('M') {
+            let files_guard = self.files.read().unwrap();
+            if self.current_index < files_guard.len() {
+                let path = &files_guard[self.current_index];
+                
+                // We need to get the metadata. In Single mode, it might be in current_decoded.
+                // In Grid mode, or if not loaded, we might need to check cache or load it?
+                // For simplicity, we check current_decoded (Single) or try to get from cache.
+                
+                let metadata = if let Some(ref dec) = self.current_decoded {
+                     dec.metadata.clone()
+                } else {
+                     // Try to get from shared cache (thumbnail or full)
+                     let (lock, _) = &*self.shared;
+                     let state = lock.lock().unwrap();
+                     state.get(self.current_index)
+                        .or_else(|| state.get_thumbnail(self.current_index))
+                        .and_then(|dec| dec.metadata.clone())
+                };
+
+                if let Some(meta) = metadata {
+                    println!("[METADATA] {}", path.display());
+                    if let Some(v) = &meta.make { println!("  Make: {}", v); }
+                    if let Some(v) = &meta.model { println!("  Model: {}", v); }
+                    if let Some(v) = &meta.datetime { println!("  Time: {}", v); }
+                    if let Some(v) = &meta.exposure_time { println!("  Exposure: {}", v); }
+                    if let Some(v) = &meta.f_number { println!("  F-Number: {}", v); }
+                    if let Some(v) = &meta.iso { println!("  ISO: {}", v); }
+                    if let Some(v) = &meta.focal_length { println!("  Focal Length: {}", v); }
+                    if let Some(v) = &meta.gps { println!("  GPS: {}", v); }
+                    println!("----------------------------------------");
+                } else {
+                    println!("[METADATA] {} - No metadata available (or image not loaded)", path.display());
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
         // Toggle help
         // ------------------------------------------------------------------
         if self.is_char_pressed('?') {
@@ -706,6 +746,14 @@ impl ViewerState {
                 }
             }
 
+            if let Some(dec) = state.get_thumbnail(self.current_index) {
+                if let Some(ref meta) = dec.metadata {
+                    if let Some(v) = &meta.datetime { lines.push(format!("Time: {}", v)); }
+                    if let Some(v) = &meta.model { lines.push(format!("Camera: {}", v)); }
+                    if let Some(v) = &meta.gps { lines.push(format!("GPS: {}", v)); }
+                }
+            }
+
             let text_scale: u32 = 2;
             let line_h = (7 * text_scale + 4) as i32;
             let bar_h = (line_h * lines.len() as i32 + 8) as u32; 
@@ -816,16 +864,33 @@ impl ViewerState {
                              if let Some(info) = map.get(path) {
                                  if info.is_original {
                                      let count = map.values().filter(|v| v.original_path == info.original_path && !v.is_original).count();
-                                     lines.push(format!("-- ORIGINAL IMAGE -- ({} copies found)", count));
-                                     dupe_color = Some((100, 255, 100, 255)); // Greenish
-                                 } else {
-                                     lines.push(format!("DUPLICATE of: {}", info.original_path.file_name().unwrap_or_default().to_string_lossy()));
-                                     lines.push(format!("Distance: {}", info.distance));
-                                     dupe_color = Some((255, 100, 100, 255)); // Reddish
-                                 }
-                             }
-                         }
-                     }
+                                    lines.push(format!("-- ORIGINAL IMAGE -- ({} copies found)", count));
+                                    dupe_color = Some((100, 255, 100, 255)); // Greenish
+                                } else {
+                                    lines.push(format!("DUPLICATE of: {}", info.original_path.file_name().unwrap_or_default().to_string_lossy()));
+                                    lines.push(format!("Distance: {}", info.distance));
+                                    dupe_color = Some((255, 100, 100, 255)); // Reddish
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(ref dec) = self.current_decoded {
+                    if let Some(ref meta) = dec.metadata {
+                        if let Some(v) = &meta.datetime { lines.push(format!("Time: {}", v)); }
+                        if let Some(v) = &meta.model { lines.push(format!("Camera: {}", v)); }
+                        
+                        // Combine settings
+                        let mut settings = String::new();
+                        if let Some(iso) = &meta.iso { settings.push_str(&format!("ISO {} ", iso)); }
+                        if let Some(exp) = &meta.exposure_time { settings.push_str(&format!("{} ", exp)); }
+                        if let Some(f) = &meta.f_number { settings.push_str(&format!("{} ", f)); }
+                        if !settings.is_empty() { lines.push(format!("Settings: {}", settings.trim())); }
+
+                        if let Some(v) = &meta.focal_length { lines.push(format!("Focal: {}", v)); }
+                        if let Some(v) = &meta.gps { lines.push(format!("GPS: {}", v)); }
+                    }
                 }
 
                 let text_scale: u32 = 2;
@@ -833,7 +898,7 @@ impl ViewerState {
                 let bar_h = (line_h * lines.len() as i32 + 8) as u32;
                 fill_rect(frame, fb_w, fb_h, 0, 0, fb_w, bar_h, (0, 0, 0, 178));
                 let white = (255, 255, 255, 255);
-                
+
                 for (i, line) in lines.iter().enumerate() {
                     let color = if i >= 4 && dupe_color.is_some() { dupe_color.unwrap() } else { white };
                     draw_text(frame, fb_w, fb_h, line, 10, 4 + line_h * i as i32, text_scale, color);

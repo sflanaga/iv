@@ -1,6 +1,7 @@
 use image::GenericImageView;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
@@ -10,12 +11,25 @@ use winit::event_loop::EventLoopProxy;
 // Decoded image data (CPU side, before GPU upload)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Debug)]
+pub struct ImageMetadata {
+    pub make: Option<String>,
+    pub model: Option<String>,
+    pub datetime: Option<String>,
+    pub exposure_time: Option<String>,
+    pub f_number: Option<String>,
+    pub iso: Option<String>,
+    pub focal_length: Option<String>,
+    pub gps: Option<String>,
+}
+
 pub struct DecodedImage {
     pub rgba_bytes: Vec<u8>,
     pub width: u32,
     pub height: u32,
     pub file_size: u64,
     pub format_name: String,
+    pub metadata: Option<ImageMetadata>,
 }
 
 impl DecodedImage {
@@ -24,8 +38,57 @@ impl DecodedImage {
     }
 }
 
+fn extract_metadata(path: &Path) -> Option<ImageMetadata> {
+    let file = fs::File::open(path).ok()?;
+    let mut bufreader = BufReader::new(file);
+    let exifreader = exif::Reader::new();
+    let exif = exifreader.read_from_container(&mut bufreader).ok()?;
+
+    let get_field = |tag| {
+        exif.get_field(tag, exif::In::PRIMARY)
+            .map(|f| f.display_value().with_unit(&exif).to_string())
+    };
+
+    let make = get_field(exif::Tag::Make);
+    let model = get_field(exif::Tag::Model);
+    let datetime = get_field(exif::Tag::DateTimeOriginal)
+        .or_else(|| get_field(exif::Tag::DateTime));
+    let exposure_time = get_field(exif::Tag::ExposureTime);
+    let f_number = get_field(exif::Tag::FNumber);
+    let iso = get_field(exif::Tag::PhotographicSensitivity);
+    let focal_length = get_field(exif::Tag::FocalLength);
+
+    // GPS logic
+    let lat_ref = get_field(exif::Tag::GPSLatitudeRef);
+    let lat = get_field(exif::Tag::GPSLatitude);
+    let lon_ref = get_field(exif::Tag::GPSLongitudeRef);
+    let lon = get_field(exif::Tag::GPSLongitude);
+    
+    let gps = match (lat, lat_ref, lon, lon_ref) {
+        (Some(lat), Some(lat_ref), Some(lon), Some(lon_ref)) => {
+            Some(format!("{} {}  {} {}", lat, lat_ref, lon, lon_ref))
+        },
+        _ => None,
+    };
+
+    Some(ImageMetadata {
+        make,
+        model,
+        datetime,
+        exposure_time,
+        f_number,
+        iso,
+        focal_length,
+        gps,
+    })
+}
+
 fn decode_image(path: &Path, target_size: Option<(u32, u32)>) -> Result<DecodedImage, String> {
     let file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    
+    // Extract metadata before decoding (fail-soft)
+    let metadata = extract_metadata(path);
+
     let img_result = image::open(path);
     
     match img_result {
@@ -51,6 +114,7 @@ fn decode_image(path: &Path, target_size: Option<(u32, u32)>) -> Result<DecodedI
                 height: f_height,
                 file_size,
                 format_name,
+                metadata,
             })
         }
         Err(e) => Err(format!("{}", e)),

@@ -10,6 +10,7 @@ Key Bindings:
   f             : Toggle fullscreen
   t             : Toggle thumbnail view
   i             : Toggle info overlay
+  M             : Dump metadata to stdout
   ?             : Toggle help overlay
   r / R         : Rotate 90° CCW / CW
   m             : Mark current file (write path to output)
