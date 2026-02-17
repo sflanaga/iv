@@ -14,6 +14,8 @@ Written by AI - just saying cause it's true.
     - **Mark Files**: Save paths of interesting images to a file or stdout for later processing.
     - **File Lists**: Load images from a text file (supports tab/space separated lists).
     - **Rotation**: Lossless visual rotation (90° steps).
+- **Duplicate Finding**: Detects and groups similar images using perceptual hashing (pHash).
+- **Extended Metadata**: Displays EXIF data (Date, Camera, ISO, GPS) and allows dumping to stdout.
 - **Format Support**: Supports all common image formats (JPG, PNG, GIF, BMP, WebP, TIFF, etc.).
 
 ## Installation
@@ -67,14 +69,26 @@ find . -name "*.jpg" > list.txt
 iv -L list.txt
 ```
 
-**Find Duplicates:**
-Scan a directory for duplicate or similar images.
+**Find Duplicates (Visual Mode):**
+Scan a directory for duplicate or similar images and review them in the grid view.
 ```bash
 # Find exact or near-exact duplicates (default threshold: 2)
 iv -D --recursive ~/Pictures
 
 # Find similar images (looser threshold, e.g. resized or slightly edited)
 iv -D --threshold 10 ~/Pictures
+```
+
+**Find Duplicates (Headless Dump):**
+Scan for duplicates and write the results to a file without opening the UI.
+```bash
+iv -D --recursive --dump duplicates.txt ~/Pictures
+```
+
+**Custom Font Size:**
+Start with a larger UI font size.
+```bash
+iv --font-size 3 ~/Pictures
 ```
 
 ### Key Bindings
@@ -87,12 +101,15 @@ iv -D --threshold 10 ~/Pictures
 | `Home` | Go to first image |
 | `End` | Go to last image |
 | `f` | Toggle fullscreen |
+| `s` | Cycle font size |
+| `t` | Toggle thumbnail view |
 | `z` | Toggle zoom (1:1 / Fit) |
 | `+` / `-` / `Wheel` | Zoom in / out |
 | `r` | Rotate 90° Counter-Clockwise |
 | `R` | Rotate 90° Clockwise |
 | `m` | Mark current file (append path to output file) |
 | `i` | Toggle info overlay |
+| `M` | Dump metadata to stdout |
 | `?` | Toggle help overlay |
 
 ## Configuration
@@ -101,8 +118,12 @@ iv -D --threshold 10 ~/Pictures
 
 - `-r, --recursive`: Search directories recursively.
 - `-m, --memory <SIZE>`: Set cache memory limit (e.g., `512MB`, `4GB`).
+- `--font-size <N>`: Initial font scale factor (default: 2).
 - `--initial-delay <MS>`: Delay before key repeat starts (default: 500ms).
 - `--repeat-delay <MS>`: Interval for key repeat (default: 35ms).
+- `-D, --find-duplicates`: Enable duplicate finding mode.
+- `--threshold <N>`: Similarity threshold for duplicates (0-64, default: 2).
+- `--dump <FILE>`: Dump found duplicates to file and exit (headless).
 
 Run `iv --help` for the full list of options.
 
